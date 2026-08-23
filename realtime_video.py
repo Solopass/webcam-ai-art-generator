@@ -755,19 +755,22 @@ def main():
                 
                 # We must encode BOTH positive and negative prompts for cfg_type="full",
                 # and use .copy_() to overwrite the existing tensor in-place.
-                # StreamDiffusion's native .update_prompt() is completely broken for CFG
-                # because it forgets the negative prompt and breaks CUDA graph memory pointers!
-                encoder_output = stream.pipe.encode_prompt(
-                    prompt=full_prompt,
-                    device=stream.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=True,
-                    negative_prompt=args.negative_prompt,
-                )
+                # Wrap in torch.no_grad() to prevent massive VRAM leak when emotions change rapidly!
+                with torch.no_grad():
+                    encoder_output = stream.pipe.encode_prompt(
+                        prompt=full_prompt,
+                        device=stream.device,
+                        num_images_per_prompt=1,
+                        do_classifier_free_guidance=True,
+                        negative_prompt=args.negative_prompt,
+                    )
                 uncond_embeds = encoder_output[1].repeat(stream.batch_size, 1, 1)
                 cond_embeds = encoder_output[0].repeat(stream.batch_size, 1, 1)
                 new_embeds = torch.cat([uncond_embeds, cond_embeds], dim=0)
                 stream.prompt_embeds.copy_(new_embeds)
+                
+                # Clear cached PyTorch autograd memory from the text encoder pass
+                torch.cuda.empty_cache()
 
             t_got = time.perf_counter()
             output_image = stream(Image.fromarray(frame_rgb))
