@@ -11,8 +11,8 @@ A real-time AI VTuber Engine: StreamDiffusion + TensorRT turning a webcam or des
 **It works flawlessly.** Measured on an RTX 3080 Ti:
 
 `
-[Engine] 10.0 FPS | wait 25.2ms  infer 70.3ms
-[Engine] output 30.0 fps, 8.4ms work/frame (composite off, smoothing on)
+[Engine] 26.4 FPS | wait 0.0ms  infer 64.0ms
+[Engine] output 26.4 fps, 2.4ms work/frame (composite off, smoothing on)
 `
 
 infer 70ms is the whole ceiling and it is a **deliberate trade**: two denoise steps at cfg_type="full" is four UNet passes per frame. The postprocess thread interpolates the 10 FPS inference stream up to a buttery 30 FPS output, which costs about two frames of latency. 
@@ -47,6 +47,9 @@ The UI communicates with the engine purely through ZeroMQ:
 * **PUSH/PULL Command Socket:** The UI pushes JSON payloads when sliders are dragged. The engine drains this queue completely during its pacing sleep cycle, meaning the UI sliders can be scrubbed vigorously without causing minutes of lag.
 
 ## 4. Completed Features
+- **Instant LoRA Hot-Swapping**: Drops VRAM and gracefully reloads new TensorRT `.engine` characters in <2 seconds.
+- **Batch Pre-Compiler**: Added `precompile_loras.py` to batch compile characters overnight.
+- **WebP Replay Exports**: UI natively supports `Ctrl+S` caching of the last 150 frames to an animated WebP file.
 - **Face & Audio Tracking**: Integrated MediaPipe and PyAudio FFT to live-inject expressions like "open mouth" into the prompt.
 - **Sensitivities & Overrides**: Allowed real-time tuning of trigger thresholds and replacement expressions via the UI.
 - **Background Compositing**: Selfie segmenter cleanly drops the user onto custom backgrounds with adjustable Bokeh blurs.

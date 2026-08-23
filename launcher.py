@@ -400,7 +400,7 @@ class VTuberStudioApp(ctk.CTk):
                                           command=self.take_snapshot)
         self.snapshot_btn.pack(fill=ctk.X, padx=10, pady=5)
         
-        self.replay_btn = ctk.CTkButton(self.right_col, text="📷 Save 5s Replay (Ctrl+S)",
+        self.replay_btn = ctk.CTkButton(self.right_col, text="📷 Save 5s WebP Replay (Ctrl+S)",
                                         command=self.save_replay)
         self.replay_btn.pack(fill=ctk.X, padx=10, pady=5)
         
@@ -639,13 +639,12 @@ class VTuberStudioApp(ctk.CTk):
                 out_dir = os.path.join(SCRIPT_DIR, "snapshots")
                 os.makedirs(out_dir, exist_ok=True)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = os.path.join(out_dir, f"replay_{ts}.mp4")
+                filename = os.path.join(out_dir, f"replay_{ts}.webp")
 
-                writer = imageio.get_writer(filename, fps=30.0, codec='libx264', format='FFMPEG')
-                for f in frames:
-                    writer.append_data(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
-                writer.close()
-                self.after(0, self.log, f"[Replay] Saved replay to {filename}")
+                rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
+                imageio.mimsave(filename, rgb_frames, format='WEBP', fps=30, loop=0, lossless=False)
+                
+                self.after(0, self.log, f"[Replay] Saved WebP replay to {filename}")
             except Exception as e:
                 self.after(0, self.log, f"[Replay] Error saving replay: {e}")
             finally:

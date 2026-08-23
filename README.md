@@ -2,11 +2,14 @@
 
 A real-time AI VTuber engine powered by **StreamDiffusion**, **TensorRT**, and **CustomTkinter**. Turns your webcam—or desktop screen recording—into a customizable, live-animated anime avatar for OBS or Discord.
 
-> **Status: Highly Optimized & Production Ready.** ~10 FPS on an RTX 3080 Ti (2-step, full CFG), smoothed to a buttery 30 FPS output with real-time zero-lag UI tuning. 
+> **Status: Highly Optimized & Production Ready.** ~26 FPS on an RTX 3080 Ti (2-step, full CFG), smoothed to a buttery 30 FPS output with real-time zero-lag UI tuning. 
 
 ## Features
 
-- **Live UI Tuning:** Tune your prompt, CFG, Motion Blur, and trigger sensitivities live via a ZeroMQ event channel without restarting the TensorRT engine.
+- **Instant LoRA Hot-Swapping:** Change your character on the fly! The engine instantly flushes VRAM and loads pre-compiled TensorRT `.engine` caches in under 2 seconds without stopping the video feed.
+- **Overnight Batch Pre-Compiler:** Drop new `.safetensors` into `loras/` and run `python precompile_loras.py` to batch-compile all your characters overnight so they are instantly ready for your stream.
+- **WebP Replay Exports:** Hit `Ctrl+S` (or use the UI button) to instantly save the last 5 seconds of your stream as an animated `.webp` for easy sharing.
+- **Live UI Tuning:** Tune your prompt, CFG, Motion Blur, and trigger sensitivities live via a ZeroMQ event channel without restarting the TensorRT engine.** Tune your prompt, CFG, Motion Blur, and trigger sensitivities live via a ZeroMQ event channel without restarting the TensorRT engine.
 - **MediaPipe Face Tracking:** Dynamically tracks your face, panning and cropping the camera automatically. Maps your real-world facial expressions (smile, closed eyes) directly into the AI prompt!
 - **Audio Lip-Sync:** Speaks when you speak! An FFT audio threshold analyzes your microphone volume to trigger "open mouth" AI generations instantly.
 - **Screen Recording Mode:** Target your desktop monitor to stylize your screen-share instead of your webcam!
