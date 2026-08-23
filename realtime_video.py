@@ -439,7 +439,7 @@ def camera_thread(cap, args):
 
 
 # ----------------------------------------------------- postprocess thread ----
-def postprocess_thread(args, zmq_socket, vcam):
+def postprocess_thread(args, zmq_socket, vcam, state_dict):
     bg_img_cache = None
     if args.bg_image and os.path.exists(args.bg_image):
         bg = cv2.imread(args.bg_image)
@@ -495,7 +495,8 @@ def postprocess_thread(args, zmq_socket, vcam):
             continue
 
         # Lerp current frame towards target frame for buttery 30 FPS motion blur
-        current_smoothed_frame = cv2.addWeighted(target_frame, 0.4, current_smoothed_frame, 0.6, 0)
+        alpha = state_dict.get("motion_smoothing", args.motion_smoothing)
+        current_smoothed_frame = cv2.addWeighted(target_frame, 1.0 - alpha, current_smoothed_frame, alpha, 0)
         display_frame = current_smoothed_frame.astype(np.uint8)
 
         # One transient send failure used to disable the virtual camera for the
@@ -575,6 +576,7 @@ def build_args():
     parser.add_argument("--guidance_scale", type=float, default=1.4)
     parser.add_argument("--delta", type=float, default=1.0)
     parser.add_argument("--freeze_threshold", type=float, default=0.98)
+    parser.add_argument("--motion_smoothing", type=float, default=0.6)
     parser.add_argument("--t_index", type=int, default=32,
                         help="Denoise start step out of 50. Lower = more AI "
                              "stylisation, higher = closer to the raw webcam.")
@@ -659,6 +661,12 @@ def cmd_listener_thread(port, state_dict):
                             state_dict["base_prompt"] = cmd["prompt"]
                             state_dict["prompt_dirty"] = True
                             log(f"[Engine] Prompt: {cmd['prompt']}")
+                    if "freeze_threshold" in cmd:
+                        state_dict["freeze_threshold_dirty"] = cmd["freeze_threshold"]
+                        log(f"[Engine] Freeze Threshold: {cmd['freeze_threshold']}")
+                    if "motion_smoothing" in cmd:
+                        state_dict["motion_smoothing"] = cmd["motion_smoothing"]
+                        log(f"[Engine] Motion Smoothing: {cmd['motion_smoothing']}")
                 except Exception as e:
                     log(f"[Engine] Bad command: {e}")
             except zmq.Again:
@@ -813,7 +821,7 @@ def main():
 
     cam_t = threading.Thread(target=camera_thread, args=(cap, args),
                              name="camera", daemon=True)
-    post_t = threading.Thread(target=postprocess_thread, args=(args, zmq_socket, vcam),
+    post_t = threading.Thread(target=postprocess_thread, args=(args, zmq_socket, vcam, state_dict),
                               name="postprocess", daemon=True)
     cam_t.start()
     post_t.start()
@@ -832,6 +840,13 @@ def main():
 
     try:
         while not STOP.is_set():
+            if "freeze_threshold_dirty" in state_dict:
+                val = state_dict.pop("freeze_threshold_dirty")
+                if hasattr(stream, "similar_filter") and stream.similar_filter is not None:
+                    stream.similar_filter.set_threshold(val)
+                elif val < 0.999:
+                    stream.enable_similar_image_filter(threshold=val, max_skip_frame=10)
+
             t_wait = time.perf_counter()
             try:
                 frame_rgb, soft_mask, original_frame_rgb, emotions = Q_IN.get(timeout=1.0)

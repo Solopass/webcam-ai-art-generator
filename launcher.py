@@ -240,9 +240,27 @@ class VTuberStudioApp(ctk.CTk):
         self.guidance_var = ctk.DoubleVar(value=max(1.05, self.settings.get("guidance", 1.4)))
         self._slider_row(1, "CFG", self.guidance_var, 1.05, 3.0, 20, fmt=lambda v: f"{v:.2f}")
 
+        import json
+        
+        def _send_freeze(v):
+            if getattr(self, "cmd_socket", None):
+                try: self.cmd_socket.send_string(json.dumps({"freeze_threshold": float(v)}))
+                except Exception: pass
+                
+        def _send_motion(v):
+            if getattr(self, "cmd_socket", None):
+                try: self.cmd_socket.send_string(json.dumps({"motion_smoothing": float(v)}))
+                except Exception: pass
+
         self.freeze_var = ctk.DoubleVar(value=self.settings.get("freeze", 1.0))
         self._slider_row(2, "Freeze", self.freeze_var, 0.90, 1.00, 10,
-                         fmt=lambda v: "off" if v >= 0.999 else f"{v:.2f}")
+                         fmt=lambda v: "off" if v >= 0.999 else f"{v:.2f}",
+                         on_change=_send_freeze)
+
+        self.motion_var = ctk.DoubleVar(value=self.settings.get("motion_smoothing", 0.6))
+        self._slider_row(3, "Motion Blur", self.motion_var, 0.0, 0.9, 90,
+                         fmt=lambda v: "off" if v < 0.01 else f"{v:.2f}",
+                         on_change=_send_motion)
 
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
@@ -297,14 +315,19 @@ class VTuberStudioApp(ctk.CTk):
         self.toggle_preview()
         self.update_video_frame()
 
-    def _slider_row(self, row, label, var, lo, hi, steps, fmt):
+    def _slider_row(self, row, label, var, lo, hi, steps, fmt, on_change=None):
         ctk.CTkLabel(self.tune_frame, text=f"{label}:", anchor="w").grid(
             row=row, column=0, padx=2, pady=3, sticky="w")
         value_label = ctk.CTkLabel(self.tune_frame, text=fmt(var.get()), width=90, anchor="e")
         value_label.grid(row=row, column=2, padx=2, pady=3, sticky="e")
+        
+        def _update(v):
+            value_label.configure(text=fmt(v))
+            if on_change:
+                on_change(v)
+                
         slider = ctk.CTkSlider(self.tune_frame, variable=var, from_=lo, to=hi,
-                               number_of_steps=steps, width=110,
-                               command=lambda v, lbl=value_label, f=fmt: lbl.configure(text=f(v)))
+                               number_of_steps=steps, width=110, command=_update)
         slider.grid(row=row, column=1, padx=2, pady=3, sticky="ew")
 
     def select_bg(self):
@@ -573,6 +596,7 @@ class VTuberStudioApp(ctk.CTk):
             "--guidance_scale", f"{max(1.05, self.guidance_var.get()):.3f}",
             "--t_index", str(strength_to_t_index(self.strength_var.get())),
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",
+            "--motion_smoothing", f"{self.motion_var.get():.2f}",
             "--zmq_port", str(zmq_port),
             "--cmd_port", str(cmd_port)
         ]
