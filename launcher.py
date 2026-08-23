@@ -369,7 +369,7 @@ class VTuberStudioApp(ctk.CTk):
         def _do_save():
             self.saving = True
             frames = list(self.frame_buffer)
-            self.log(f"[Replay] Saving {len(frames)} frames to disk...")
+            self.after(0, lambda: self.log(f"[Replay] Saving {len(frames)} frames to disk..."))
             
             os.makedirs("snapshots", exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -381,7 +381,7 @@ class VTuberStudioApp(ctk.CTk):
                 out.write(f)
             out.release()
             
-            self.log(f"[Replay] Saved 5-second replay to {filename}!")
+            self.after(0, lambda: self.log(f"[Replay] Saved 5-second replay to {filename}!"))
             self.saving = False
             
         threading.Thread(target=_do_save, daemon=True).start()
@@ -390,6 +390,12 @@ class VTuberStudioApp(ctk.CTk):
     def log(self, message):
         self.log_box.configure(state="normal")
         self.log_box.insert("end", message + "\n")
+        
+        # Prevent the text box from growing infinitely and lagging the GUI
+        lines = int(self.log_box.index('end-1c').split('.')[0])
+        if lines > 500:
+            self.log_box.delete("1.0", f"{lines - 500}.0")
+            
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
         if self.log_file:
