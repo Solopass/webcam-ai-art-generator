@@ -284,7 +284,8 @@ def camera_thread(cap, args, state_dict):
 
     # Always use selfie segmentation to isolate the user from the background
     # before AI generation, avoiding background bleed-in (AI Green Screen).
-    segmenter = mp_solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
+    # However, if capturing a screen, we want to stylize the whole screen, not just people!
+    segmenter = None if getattr(cap, "is_screen", False) else mp_solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
     face_detector = None
     face_mesh = None
     if not args.no_face_track:
