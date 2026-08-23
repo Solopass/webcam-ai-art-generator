@@ -355,7 +355,7 @@ def camera_thread(cap, args):
         emotions = []
         if face_mesh is not None:
             try:
-                fm_res = face_mesh.process(original_frame_rgb)
+                fm_res = face_mesh.process(frame_rgb)
                 if fm_res.multi_face_landmarks:
                     landmarks = fm_res.multi_face_landmarks[0].landmark
                     # Calculate vertical mouth opening (landmarks 13 and 14)
@@ -401,7 +401,6 @@ def camera_thread(cap, args):
 
 # ----------------------------------------------------- postprocess thread ----
 def postprocess_thread(args, zmq_socket, vcam):
-    anchor_frame = None
     bg_img_cache = None
     if args.bg_image and os.path.exists(args.bg_image):
         bg = cv2.imread(args.bg_image)
@@ -410,68 +409,75 @@ def postprocess_thread(args, zmq_socket, vcam):
         else:
             log(f"[Engine] Could not read background image: {args.bg_image}")
 
-    start_time = time.time()
+    current_smoothed_frame = None
+    target_frame = None
     frame_count = 0
-    cost = 0.0
 
     while not STOP.is_set():
-        try:
-            item = Q_OUT.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        if item is None:
-            break
-        out_frame, soft_mask, original_frame_rgb = item
         t0 = time.perf_counter()
-
-        # Unsharp mask — crisps up the lines the TinyVAE softens.
-        gaussian = cv2.GaussianBlur(out_frame, (0, 0), 1.5)
-        out_frame = cv2.addWeighted(out_frame, 1.4, gaussian, -0.4, 0)
-
-        # Vivid anime colour pop.
-        hsv = cv2.cvtColor(out_frame, cv2.COLOR_BGR2HSV)
-        h, s, v = cv2.split(hsv)
-        s = cv2.add(s, 20)
-        v = cv2.add(v, 10)
-        out_frame = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
-
-        # Alpha compositing — only when a background was actually requested.
-        # When it is off you see the full AI frame, which is what most people
-        # expect "AI VTuber" to look like.
-        if soft_mask is not None:
-            alpha = soft_mask[..., np.newaxis].astype(np.float32)
+        try:
+            item = Q_OUT.get_nowait()
+            if item is None:
+                break
+            raw_out_frame, soft_mask, original_frame_rgb = item
+    
+            # Post-process the newly arrived frame
+            gaussian = cv2.GaussianBlur(raw_out_frame, (0, 0), 1.5)
+            out_frame = cv2.addWeighted(raw_out_frame, 1.4, gaussian, -0.4, 0)
+    
+            hsv = cv2.cvtColor(out_frame, cv2.COLOR_BGR2HSV)
+            h, s, v = cv2.split(hsv)
+            s = cv2.add(s, 20)
+            v = cv2.add(v, 10)
+            out_frame = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+    
+            if soft_mask is not None:
+                alpha = soft_mask[..., np.newaxis].astype(np.float32)
+                if bg_img_cache is not None:
+                    out_frame = (out_frame.astype(np.float32) * alpha + bg_img_cache.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+                elif args.composite:
+                    bg_to_use = cv2.cvtColor(original_frame_rgb, cv2.COLOR_RGB2BGR)
+                    out_frame = (out_frame.astype(np.float32) * alpha + bg_to_use.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
             
-            # If the user provided a custom BG image, use it
-            if bg_img_cache is not None:
-                bg_to_use = bg_img_cache
-                out_frame = (out_frame.astype(np.float32) * alpha
-                             + bg_to_use.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-            # Otherwise, only paste the real room back if args.composite is True
-            elif args.composite:
-                bg_to_use = cv2.cvtColor(original_frame_rgb, cv2.COLOR_RGB2BGR)
-                out_frame = (out_frame.astype(np.float32) * alpha
-                             + bg_to_use.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-            # If neither, we leave the AI-generated background (which is based on the neutral gray)
+            target_frame = out_frame.astype(np.float32)
+            if current_smoothed_frame is None:
+                current_smoothed_frame = target_frame.copy()
+        except queue.Empty:
+            pass
+
+        if target_frame is None:
+            import time
+            time.sleep(0.033)
+            continue
+
+        # Lerp current frame towards target frame for buttery 30 FPS motion blur
+        current_smoothed_frame = cv2.addWeighted(target_frame, 0.4, current_smoothed_frame, 0.6, 0)
+        display_frame = current_smoothed_frame.astype(np.uint8)
 
         if vcam is not None:
-            hd = cv2.resize(out_frame, (1024, 1024), interpolation=cv2.INTER_LINEAR)
+            hd = cv2.resize(display_frame, (1024, 1024), interpolation=cv2.INTER_LINEAR)
             try:
                 vcam.send(cv2.cvtColor(hd, cv2.COLOR_BGR2RGB))
+                vcam.sleep_until_next_frame()
             except Exception as e:
                 log(f"[Engine] Virtual camera send failed: {e}")
                 vcam = None
-                
-        if frame_count == 20:
-            cv2.imwrite("test_output.png", out_frame)
-            log("[Engine] Saved test_output.png!")
 
         if zmq_socket is not None:
-            ok, buffer = cv2.imencode('.jpg', out_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            ok, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             if ok:
                 try:
                     zmq_socket.send(buffer.tobytes())
                 except Exception:
                     pass
+        
+        if vcam is None:
+            import time
+            time.sleep(0.033)
+
+        frame_count += 1
+        if frame_count == 20:
+            cv2.imwrite("test_output.png", display_frame)
 
         frame_count += 1
         cost += time.perf_counter() - t0
