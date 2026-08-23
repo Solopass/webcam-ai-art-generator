@@ -412,6 +412,8 @@ def postprocess_thread(args, zmq_socket, vcam):
     current_smoothed_frame = None
     target_frame = None
     frame_count = 0
+    cost = 0.0
+    start_time = time.time()
 
     while not STOP.is_set():
         t0 = time.perf_counter()
@@ -477,7 +479,6 @@ def postprocess_thread(args, zmq_socket, vcam):
         if frame_count == 20:
             cv2.imwrite("test_output.png", display_frame)
 
-        frame_count += 1
         cost += time.perf_counter() - t0
         elapsed = time.time() - start_time
         if elapsed > 10.0 and frame_count:
