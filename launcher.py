@@ -214,15 +214,19 @@ class VTuberStudioApp(ctk.CTk):
         ctk.CTkLabel(self.settings_frame, text="Character (LoRA):", anchor="w").grid(
             row=1, column=0, padx=5, pady=5, sticky="w")
         lora_dir = os.path.join(SCRIPT_DIR, "loras")
-        loras = ["None"]
+        loras = ["None (Original Default)"]
         if os.path.isdir(lora_dir):
             loras += sorted(f for f in os.listdir(lora_dir) if f.endswith(".safetensors"))
         def on_lora_changed(val):
+            if val == "None (Original Default)":
+                val = "None"
             if self.process is not None:
                 self.send_command({"lora": val})
 
-        saved_lora = self.settings.get("lora", "None")
-        self.lora_var = ctk.StringVar(value=saved_lora if saved_lora in loras else "None")
+        saved_lora = self.settings.get("lora", "None (Original Default)")
+        if saved_lora == "None":
+            saved_lora = "None (Original Default)"
+        self.lora_var = ctk.StringVar(value=saved_lora if saved_lora in loras else "None (Original Default)")
         self.lora_dropdown = ctk.CTkOptionMenu(self.settings_frame, variable=self.lora_var,
                                                values=loras, width=140, command=on_lora_changed)
         self.lora_dropdown.grid(row=1, column=1, padx=5, pady=5, sticky="w")
@@ -693,13 +697,16 @@ class VTuberStudioApp(ctk.CTk):
         return sys.executable
 
     def build_command(self, zmq_port, cmd_port):
+        lora_val = self.lora_var.get()
+        if lora_val == "None (Original Default)":
+            lora_val = "None"
         cmd = [
             self.python_executable(), "-u",
             os.path.join(SCRIPT_DIR, "realtime_video.py"),
             "--prompt", self.prompt_entry.get(),
             "--negative_prompt", self.neg_prompt_entry.get(),
             "--camera", self.camera_entry.get().strip() or "0",
-            "--lora", self.lora_var.get(),
+            "--lora", lora_val,
             "--guidance_scale", f"{max(1.05, self.guidance_var.get()):.3f}",
             "--t_index", str(strength_to_t_index(self.strength_var.get())),
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",
