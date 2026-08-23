@@ -232,13 +232,15 @@ class VTuberStudioApp(ctk.CTk):
 
         self.strength_var = ctk.DoubleVar(value=self.settings.get("ai_strength", 40.0))
         self._slider_row(0, "AI Strength", self.strength_var, 0, 100, 20,
-                         fmt=lambda v: f"{int(v)} (step {strength_to_t_index(v)})")
+                         fmt=lambda v: f"{int(v)} (step {strength_to_t_index(v)})",
+                         desc="Higher = closer to raw webcam, Lower = more AI stylization.")
 
         # Floor of 1.05, not 1.0: at exactly 1.0 StreamDiffusion disables
         # classifier-free guidance entirely, which halves the prompt-embed
         # tensor and changes the UNet batch out from under the built engine.
         self.guidance_var = ctk.DoubleVar(value=max(1.05, self.settings.get("guidance", 1.4)))
-        self._slider_row(1, "CFG", self.guidance_var, 1.05, 3.0, 20, fmt=lambda v: f"{v:.2f}")
+        self._slider_row(1, "Prompt Strictness (CFG)", self.guidance_var, 1.05, 3.0, 20, fmt=lambda v: f"{v:.2f}",
+                         desc="How strictly the AI follows your text prompt. High values may look deep-fried.")
 
         import json
         
@@ -253,14 +255,16 @@ class VTuberStudioApp(ctk.CTk):
                 except Exception: pass
 
         self.freeze_var = ctk.DoubleVar(value=self.settings.get("freeze", 1.0))
-        self._slider_row(2, "Freeze", self.freeze_var, 0.90, 1.00, 10,
+        self._slider_row(2, "Freeze Filter", self.freeze_var, 0.90, 1.00, 10,
                          fmt=lambda v: "off" if v >= 0.999 else f"{v:.2f}",
-                         on_change=_send_freeze)
+                         on_change=_send_freeze,
+                         desc="Pauses generation when you sit perfectly still to increase visual quality.")
 
         self.motion_var = ctk.DoubleVar(value=self.settings.get("motion_smoothing", 0.6))
         self._slider_row(3, "Motion Blur", self.motion_var, 0.0, 0.9, 90,
                          fmt=lambda v: "off" if v < 0.01 else f"{v:.2f}",
-                         on_change=_send_motion)
+                         on_change=_send_motion,
+                         desc="Blends frames together for cinematic motion blur. Set to 'off' for raw responsiveness.")
 
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
@@ -315,11 +319,12 @@ class VTuberStudioApp(ctk.CTk):
         self.toggle_preview()
         self.update_video_frame()
 
-    def _slider_row(self, row, label, var, lo, hi, steps, fmt, on_change=None):
+    def _slider_row(self, row, label, var, lo, hi, steps, fmt, desc=None, on_change=None):
+        r = row * 2
         ctk.CTkLabel(self.tune_frame, text=f"{label}:", anchor="w").grid(
-            row=row, column=0, padx=2, pady=3, sticky="w")
+            row=r, column=0, padx=2, pady=3, sticky="w")
         value_label = ctk.CTkLabel(self.tune_frame, text=fmt(var.get()), width=90, anchor="e")
-        value_label.grid(row=row, column=2, padx=2, pady=3, sticky="e")
+        value_label.grid(row=r, column=2, padx=2, pady=3, sticky="e")
         
         def _update(v):
             value_label.configure(text=fmt(v))
@@ -328,7 +333,11 @@ class VTuberStudioApp(ctk.CTk):
                 
         slider = ctk.CTkSlider(self.tune_frame, variable=var, from_=lo, to=hi,
                                number_of_steps=steps, width=110, command=_update)
-        slider.grid(row=row, column=1, padx=2, pady=3, sticky="ew")
+        slider.grid(row=r, column=1, padx=2, pady=3, sticky="ew")
+        
+        if desc:
+            desc_label = ctk.CTkLabel(self.tune_frame, text=desc, font=ctk.CTkFont(size=11), text_color="gray", justify="left", wraplength=350)
+            desc_label.grid(row=r+1, column=0, columnspan=3, padx=2, pady=(0, 10), sticky="w")
 
     def select_bg(self):
         from tkinter import filedialog
