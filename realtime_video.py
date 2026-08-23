@@ -222,7 +222,6 @@ class ThreadedCamera:
                 self.new_frame_event.set()
                 time.sleep(0.033)
             elif self.is_screen:
-                import numpy as np
                 sct_img = self.sct.grab(self.monitor)
                 self.frame = np.array(sct_img)[:, :, :3]
                 self.status = True
