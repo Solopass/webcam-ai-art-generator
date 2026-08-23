@@ -279,7 +279,7 @@ def scan_cameras(limit=6):
 
 
 # ---------------------------------------------------------- camera thread ----
-def camera_thread(cap, args):
+def camera_thread(cap, args, state_dict):
     import mediapipe.python.solutions as mp_solutions
 
     # Always use selfie segmentation to isolate the user from the background
@@ -390,20 +390,19 @@ def camera_thread(cap, args):
                 fm_res = face_mesh.process(frame_rgb)
                 if fm_res.multi_face_landmarks:
                     landmarks = fm_res.multi_face_landmarks[0].landmark
+                    sens_overrides = state_dict.get("sens_overrides", {})
+                    mouth_sens = sens_overrides.get("mouth", 0.030)
+                    smile_sens = sens_overrides.get("smile", 0.010)
+                    eyes_sens = sens_overrides.get("eyes", 0.019)
+                    
                     # Calculate vertical mouth opening (landmarks 13 and 14)
                     mouth_top = np.array([landmarks[13].x, landmarks[13].y])
                     mouth_bottom = np.array([landmarks[14].x, landmarks[14].y])
                     mouth_open = np.linalg.norm(mouth_top - mouth_bottom)
                     
-                    # Every threshold below is hysteretic: a single cutoff makes
-                    # the state chatter while you hold still, and each flip
-                    # re-encodes the CLIP prompt in the inference loop. The old
-                    # mouth test also had a dead band between 0.01 and 0.04
-                    # where it emitted neither state, so it cycled through three
-                    # different prompts on the way to your mouth closing.
-                    if mouth_open > (0.030 if mouth_open_state else 0.045):
+                    if mouth_open > (mouth_sens * 0.6 if mouth_open_state else mouth_sens):
                         mouth_open_state = True
-                    elif mouth_open < 0.030:
+                    elif mouth_open < mouth_sens * 0.6:
                         mouth_open_state = False
                     emotions.append("open mouth" if mouth_open_state else "closed mouth")
 
@@ -412,9 +411,9 @@ def camera_thread(cap, args):
                     right_corner = landmarks[291].y
                     center_lip = landmarks[13].y
                     smile = min(center_lip - left_corner, center_lip - right_corner)
-                    if smile > (0.010 if smiling_state else 0.018):
+                    if smile > (smile_sens * 0.55 if smiling_state else smile_sens):
                         smiling_state = True
-                    elif smile < 0.010:
+                    elif smile < smile_sens * 0.55:
                         smiling_state = False
                     if smiling_state:
                         emotions.append("smiling")
@@ -423,9 +422,9 @@ def camera_thread(cap, args):
                     left_eye_open = landmarks[145].y - landmarks[159].y
                     right_eye_open = landmarks[374].y - landmarks[386].y
                     eye_open = max(left_eye_open, right_eye_open)
-                    if eye_open < (0.019 if eyes_closed_state else 0.013):
+                    if eye_open < (eyes_sens if eyes_closed_state else eyes_sens * 0.7):
                         eyes_closed_state = True
-                    elif eye_open > 0.019:
+                    elif eye_open > eyes_sens:
                         eyes_closed_state = False
                     if eyes_closed_state:
                         emotions.append("closed eyes")
@@ -594,6 +593,7 @@ def build_args():
     parser.add_argument("--motion_smoothing", type=float, default=0.6)
     parser.add_argument("--bokeh_blur", type=float, default=0.0)
     parser.add_argument("--expr_overrides", type=str, default="{}")
+    parser.add_argument("--sens_overrides", type=str, default="{}")
     parser.add_argument("--t_index", type=int, default=32,
                         help="Denoise start step out of 50. Lower = more AI "
                              "stylisation, higher = closer to the raw webcam.")
@@ -693,6 +693,11 @@ def cmd_listener_thread(port, state_dict):
                         state_dict["expr_overrides"].update(cmd["expr_override"])
                         state_dict["prompt_dirty"] = True
                         log(f"[Engine] Expression Override: {cmd['expr_override']}")
+                    if "sens_override" in cmd:
+                        if "sens_overrides" not in state_dict:
+                            state_dict["sens_overrides"] = {}
+                        state_dict["sens_overrides"].update(cmd["sens_override"])
+                        log(f"[Engine] Sensitivity Override: {cmd['sens_override']}")
                 except Exception as e:
                     log(f"[Engine] Bad command: {e}")
             except zmq.Again:
@@ -782,10 +787,16 @@ def main():
         expr_overrides = json.loads(args.expr_overrides)
     except Exception:
         expr_overrides = {}
+        
+    try:
+        sens_overrides = json.loads(args.sens_overrides)
+    except Exception:
+        sens_overrides = {}
 
     state_dict = {"base_prompt": args.prompt,
                   "negative_prompt": args.negative_prompt,
                   "expr_overrides": expr_overrides,
+                  "sens_overrides": sens_overrides,
                   "prompt_dirty": True}
     
     if args.cmd_port > 0:
@@ -852,7 +863,7 @@ def main():
         except Exception as e:
             log(f"[Engine] Audio lip-sync unavailable ({e}).")
 
-    cam_t = threading.Thread(target=camera_thread, args=(cap, args),
+    cam_t = threading.Thread(target=camera_thread, args=(cap, args, state_dict),
                              name="camera", daemon=True)
     post_t = threading.Thread(target=postprocess_thread, args=(args, zmq_socket, vcam, state_dict),
                               name="postprocess", daemon=True)
@@ -900,15 +911,19 @@ def main():
                     STOP.set()
                 continue
 
-            if audio_tracker is not None and audio_tracker.is_speaking:
-                # The face mesh now always emits one of "open mouth"/"closed
-                # mouth", so appending blindly produced a prompt asking for both
-                # at once. Replace rather than add.
-                if "open mouth" not in emotions:
-                    emotions = ["open mouth" if e == "closed mouth" else e
-                                for e in emotions]
+            if audio_tracker is not None:
+                audio_sens = state_dict.get("sens_overrides", {}).get("audio", 1.5)
+                audio_tracker.set_threshold(audio_sens)
+                
+                if audio_tracker.is_speaking:
+                    # The face mesh now always emits one of "open mouth"/"closed
+                    # mouth", so appending blindly produced a prompt asking for both
+                    # at once. Replace rather than add.
                     if "open mouth" not in emotions:
-                        emotions.append("open mouth")
+                        emotions = ["open mouth" if e == "closed mouth" else e
+                                    for e in emotions]
+                        if "open mouth" not in emotions:
+                            emotions.append("open mouth")
                     
             if emotions != current_emotions or state_dict["prompt_dirty"]:
                 current_emotions = emotions.copy()

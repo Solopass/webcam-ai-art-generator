@@ -121,6 +121,8 @@ class VTuberStudioApp(ctk.CTk):
         }
         for e, v in self.expr_vars.items():
             settings[f"expr_{e}"] = v.get()
+        for k, v in self.sens_vars.items():
+            settings[f"sens_{k}"] = v.get()
             
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -310,6 +312,28 @@ class VTuberStudioApp(ctk.CTk):
             def make_cb(e, v):
                 return lambda *args: self.cmd_socket.send_string(json.dumps({"expr_override": {e: v.get()}})) if getattr(self, "cmd_socket", None) else None
             var.trace_add("write", make_cb(expr, var))
+
+        # Sensitivities
+        ctk.CTkLabel(self.right_col, text="Trigger Sensitivities",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(fill=ctk.X, padx=10, pady=(15, 5))
+        
+        self.sens_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
+        self.sens_frame.pack(fill=ctk.X, padx=10)
+        
+        self.sens_vars = {}
+        defaults = {"smile": 0.010, "mouth": 0.030, "eyes": 0.019, "audio": 1.5}
+        limits = {"smile": (0.001, 0.05), "mouth": (0.005, 0.1), "eyes": (0.005, 0.05), "audio": (0.1, 10.0)}
+        
+        for i, key in enumerate(["smile", "mouth", "eyes", "audio"]):
+            ctk.CTkLabel(self.sens_frame, text=f"{key}:", font=ctk.CTkFont(size=11), anchor="w").grid(row=i, column=0, sticky="w", pady=2)
+            var = ctk.DoubleVar(value=self.settings.get(f"sens_{key}", defaults[key]))
+            self.sens_vars[key] = var
+            
+            def make_sens_cb(k, v):
+                return lambda val: self.cmd_socket.send_string(json.dumps({"sens_override": {k: float(val)}})) if getattr(self, "cmd_socket", None) else None
+                
+            slider = ctk.CTkSlider(self.sens_frame, variable=var, from_=limits[key][0], to=limits[key][1], width=140, command=make_sens_cb(key, var))
+            slider.grid(row=i, column=1, sticky="ew", padx=(10, 0), pady=2)
 
         # Logs
         ctk.CTkLabel(self.right_col, text="Engine Logs:", anchor="w").pack(
@@ -645,6 +669,7 @@ class VTuberStudioApp(ctk.CTk):
             "--motion_smoothing", f"{self.motion_var.get():.2f}",
             "--bokeh_blur", f"{self.bokeh_var.get():.2f}",
             "--expr_overrides", json.dumps({e: v.get() for e, v in self.expr_vars.items()}),
+            "--sens_overrides", json.dumps({k: v.get() for k, v in self.sens_vars.items()}),
             "--zmq_port", str(zmq_port),
             "--cmd_port", str(cmd_port)
         ]
