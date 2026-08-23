@@ -182,7 +182,7 @@ class VTuberStudioApp(ctk.CTk):
 
         ctk.CTkLabel(self.settings_frame, text="Camera Index:", anchor="w").grid(
             row=0, column=0, padx=5, pady=5, sticky="w")
-        self.camera_entry = ctk.CTkComboBox(self.settings_frame, width=100, values=["0", "1", "screen 1", "screen 2", "screen 3"])
+        self.camera_entry = ctk.CTkComboBox(self.settings_frame, width=150, values=["0", "1", "screen 1 (Primary)", "screen 2 (Secondary)", "screen 3 (Tertiary)"])
         self.camera_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
         ctk.CTkLabel(self.settings_frame, text="Character (LoRA):", anchor="w").grid(
@@ -698,7 +698,7 @@ class VTuberStudioApp(ctk.CTk):
 
     def _set_ui_state(self, state):
         self.camera_entry.configure(state=state)
-        self.lora_entry.configure(state=state)
+        self.lora_dropdown.configure(state=state)
         self.preview_cb.configure(state=state)
         self.mirror_cb.configure(state=state)
         self.vcam_cb.configure(state=state)
