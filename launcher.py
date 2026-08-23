@@ -114,7 +114,11 @@ class VTuberStudioApp(ctk.CTk):
             "guidance": self.guidance_var.get(),
             "ai_strength": self.strength_var.get(),
             "freeze": self.freeze_var.get(),
+            "motion_smoothing": self.motion_var.get(),
         }
+        for e, v in self.expr_vars.items():
+            settings[f"expr_{e}"] = v.get()
+            
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=4)
@@ -273,6 +277,25 @@ class VTuberStudioApp(ctk.CTk):
         self.cudagraph_var = ctk.BooleanVar(value=self.settings.get("cuda_graph", True))
         ctk.CTkSwitch(self.right_col, text="CUDA Graph (10% faster)",
                       variable=self.cudagraph_var).pack(anchor="w", padx=15, pady=4)
+
+        # Expressions
+        ctk.CTkLabel(self.right_col, text="Expression Overrides",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(fill=ctk.X, padx=10, pady=(15, 5))
+        
+        self.expr_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
+        self.expr_frame.pack(fill=ctk.X, padx=10)
+        
+        self.expr_vars = {}
+        for i, expr in enumerate(["smiling", "open mouth", "closed eyes"]):
+            ctk.CTkLabel(self.expr_frame, text=f"{expr}:", font=ctk.CTkFont(size=11), anchor="w").grid(row=i*2, column=0, sticky="w", pady=(5,0))
+            var = ctk.StringVar(value=self.settings.get(f"expr_{expr}", expr))
+            self.expr_vars[expr] = var
+            entry = ctk.CTkEntry(self.expr_frame, textvariable=var, width=250, height=24)
+            entry.grid(row=i*2+1, column=0, sticky="ew")
+            # Bind live update over ZMQ
+            def make_cb(e, v):
+                return lambda *args: self.cmd_socket.send_string(json.dumps({"expr_override": {e: v.get()}})) if getattr(self, "cmd_socket", None) else None
+            var.trace_add("write", make_cb(expr, var))
 
         # Logs
         ctk.CTkLabel(self.right_col, text="Engine Logs:", anchor="w").pack(
@@ -606,6 +629,7 @@ class VTuberStudioApp(ctk.CTk):
             "--t_index", str(strength_to_t_index(self.strength_var.get())),
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",
             "--motion_smoothing", f"{self.motion_var.get():.2f}",
+            "--expr_overrides", json.dumps({e: v.get() for e, v in self.expr_vars.items()}),
             "--zmq_port", str(zmq_port),
             "--cmd_port", str(cmd_port)
         ]

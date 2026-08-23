@@ -577,6 +577,7 @@ def build_args():
     parser.add_argument("--delta", type=float, default=1.0)
     parser.add_argument("--freeze_threshold", type=float, default=0.98)
     parser.add_argument("--motion_smoothing", type=float, default=0.6)
+    parser.add_argument("--expr_overrides", type=str, default="{}")
     parser.add_argument("--t_index", type=int, default=32,
                         help="Denoise start step out of 50. Lower = more AI "
                              "stylisation, higher = closer to the raw webcam.")
@@ -667,6 +668,12 @@ def cmd_listener_thread(port, state_dict):
                     if "motion_smoothing" in cmd:
                         state_dict["motion_smoothing"] = cmd["motion_smoothing"]
                         log(f"[Engine] Motion Smoothing: {cmd['motion_smoothing']}")
+                    if "expr_override" in cmd:
+                        if "expr_overrides" not in state_dict:
+                            state_dict["expr_overrides"] = {}
+                        state_dict["expr_overrides"].update(cmd["expr_override"])
+                        state_dict["prompt_dirty"] = True
+                        log(f"[Engine] Expression Override: {cmd['expr_override']}")
                 except Exception as e:
                     log(f"[Engine] Bad command: {e}")
             except zmq.Again:
@@ -751,8 +758,15 @@ def main():
     # freshly built TensorRT engine produces noise at 1 step.
     stream.fuse_lora()
 
+    import json
+    try:
+        expr_overrides = json.loads(args.expr_overrides)
+    except Exception:
+        expr_overrides = {}
+
     state_dict = {"base_prompt": args.prompt,
                   "negative_prompt": args.negative_prompt,
+                  "expr_overrides": expr_overrides,
                   "prompt_dirty": True}
     
     if args.cmd_port > 0:
@@ -880,7 +894,10 @@ def main():
             if emotions != current_emotions or state_dict["prompt_dirty"]:
                 current_emotions = emotions.copy()
                 state_dict["prompt_dirty"] = False
-                emotion_str = ", ".join(emotions) if emotions else ""
+                overrides = state_dict.get("expr_overrides", {})
+                mapped = [overrides.get(e, e) for e in emotions]
+                mapped = [m for m in mapped if m.strip()] # filter out empty strings if user wants to disable an emotion
+                emotion_str = ", ".join(mapped) if mapped else ""
                 full_prompt = state_dict["base_prompt"] + (f", {emotion_str}" if emotion_str else "")
                 
                 # We must encode BOTH positive and negative prompts for cfg_type="full",
