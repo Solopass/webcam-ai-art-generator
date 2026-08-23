@@ -1,0 +1,17 @@
+{
+    "prompt": "wizard with a castle background",
+    "negative_prompt": "blurry, deformed, bad anatomy, pixelated, jpeg artifacts",
+    "camera": "0",
+    "embedded_preview": true,
+    "mirror_camera": true,
+    "virtual_camera": false,
+    "audio_sync": false,
+    "keep_background": false,
+    "normalize_lighting": false,
+    "cuda_graph": false,
+    "lora": "None",
+    "bg_image": "",
+    "guidance": 1.4,
+    "ai_strength": 55.0,
+    "freeze": 0.95
+}

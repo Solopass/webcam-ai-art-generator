@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+logs/
+engines_tinyvae_fb*/
+*.engine
+*.onnx
+*.safetensors
+test_output.png
+*.mp4
+*.avi
