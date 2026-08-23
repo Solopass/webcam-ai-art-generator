@@ -15,7 +15,7 @@ A real-time AI VTuber engine powered by **StreamDiffusion**, **TensorRT**, and *
 - **Screen Recording Mode:** Target your desktop monitor to stylize your screen-share instead of your webcam!
 - **AI Green Screen:** Uses Selfie Segmentation to cut you out of your background, perfectly preventing the AI from hallucinating room details into your character.
 - **Background Compositing & Bokeh:** Composite your anime avatar over a custom image, or over your raw room background with an adjustable Gaussian Bokeh blur.
-- **Buttery Motion Blur:** An adjustable temporal lerp filter smooths the AI's 10 FPS output into a flawless 30 FPS display stream.
+- **Buttery Motion Blur:** An adjustable temporal lerp filter smooths the AI's native ~26 FPS output into a flawless 30-60 FPS display stream.
 - **OBS Virtual Camera Integration:** Sends the generated output directly to OBS Studio as a virtual webcam.
 
 ## Running it

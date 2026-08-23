@@ -6,7 +6,7 @@ Last updated 2026-08-23. Read this document before contributing or changing code
 
 ## 1. What this is and where it stands
 
-A real-time AI VTuber Engine: StreamDiffusion + TensorRT turning a webcam or desktop feed into a live stylised video stream at ~10 FPS, with real-time UI tuning via ZMQ, Audio Lip-Sync, and Face Tracking.
+A real-time AI VTuber Engine: StreamDiffusion + TensorRT turning a webcam or desktop feed into a live stylised video stream at ~26 FPS, with real-time UI tuning via ZMQ, Audio Lip-Sync, and Face Tracking.
 
 **It works flawlessly.** Measured on an RTX 3080 Ti:
 
@@ -15,7 +15,7 @@ A real-time AI VTuber Engine: StreamDiffusion + TensorRT turning a webcam or des
 [Engine] output 26.4 fps, 2.4ms work/frame (composite off, smoothing on)
 `
 
-infer 70ms is the whole ceiling and it is a **deliberate trade**: two denoise steps at cfg_type="full" is four UNet passes per frame. The postprocess thread interpolates the 10 FPS inference stream up to a buttery 30 FPS output, which costs about two frames of latency. 
+infer 64ms is the whole ceiling and it is a **deliberate trade**: two denoise steps at cfg_type="full" is four UNet passes per frame. The postprocess thread interpolates the ~26 FPS inference stream up to a buttery 30+ FPS output, which costs about two frames of latency.
 
 `
 Start_GUI.bat                             # Boot the visual Launcher
