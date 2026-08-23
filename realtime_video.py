@@ -446,7 +446,6 @@ def postprocess_thread(args, zmq_socket, vcam):
             pass
 
         if target_frame is None:
-            import time
             time.sleep(0.033)
             continue
 
@@ -472,7 +471,6 @@ def postprocess_thread(args, zmq_socket, vcam):
                     pass
         
         if vcam is None:
-            import time
             time.sleep(0.033)
 
         frame_count += 1
