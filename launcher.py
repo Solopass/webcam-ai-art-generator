@@ -180,7 +180,7 @@ class VTuberStudioApp(ctk.CTk):
 
         ctk.CTkLabel(self.settings_frame, text="Camera Index:", anchor="w").grid(
             row=0, column=0, padx=5, pady=5, sticky="w")
-        self.camera_entry = ctk.CTkComboBox(self.settings_frame, width=100, values=["0", "1", "screen"])
+        self.camera_entry = ctk.CTkComboBox(self.settings_frame, width=100, values=["0", "1", "screen 1", "screen 2", "screen 3"])
         self.camera_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
         ctk.CTkLabel(self.settings_frame, text="Character (LoRA):", anchor="w").grid(

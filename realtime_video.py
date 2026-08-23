@@ -152,8 +152,14 @@ class ThreadedCamera:
 
         if mock:
             self._become_mock()
-        elif str(src).lower() == "screen":
-            self._become_screen()
+        elif str(src).lower().startswith("screen"):
+            screen_idx = 1
+            if " " in str(src):
+                try:
+                    screen_idx = int(str(src).split(" ")[1])
+                except ValueError:
+                    pass
+            self._become_screen(screen_idx)
         else:
             if isinstance(src, int) and sys.platform == "win32":
                 self.capture = cv2.VideoCapture(src, cv2.CAP_DSHOW)
@@ -195,12 +201,16 @@ class ThreadedCamera:
         base = np.repeat(gx[None, :], 480, axis=0)
         self.frame = cv2.merge((base, base[::-1], np.full_like(base, 128)))
 
-    def _become_screen(self):
-        log("[Camera] Capturing Screen (Desktop) instead of a webcam.")
+    def _become_screen(self, screen_idx=1):
+        log(f"[Camera] Capturing Screen {screen_idx} (Desktop) instead of a webcam.")
         import mss
         self.is_screen = True
         self.sct = mss.mss()
-        self.monitor = self.sct.monitors[1]
+        if screen_idx < len(self.sct.monitors):
+            self.monitor = self.sct.monitors[screen_idx]
+        else:
+            log(f"[Camera] Screen {screen_idx} not found. Falling back to Screen 1.")
+            self.monitor = self.sct.monitors[1]
         self.status = True
         self.frame = np.array(self.sct.grab(self.monitor))[:, :, :3]
 
