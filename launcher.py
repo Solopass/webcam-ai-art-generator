@@ -57,7 +57,7 @@ class VTuberStudioApp(ctk.CTk):
         self.current_frame_image = None
         self.log_file = None
         import collections
-        self.frame_buffer = collections.deque(maxlen=50)
+        self.frame_buffer = collections.deque(maxlen=150)
 
         # Global Keybinds
         self.bind("<Control-s>", lambda e: self.save_replay())
@@ -336,7 +336,7 @@ class VTuberStudioApp(ctk.CTk):
                         # If recording, write it!
                         if getattr(self, "is_recording", False) and getattr(self, "video_writer", None) is not None:
                             try:
-                                self.video_writer.write(img_np)
+                                self.video_writer.append_data(cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB))
                             except Exception:
                                 pass
                               
@@ -404,8 +404,8 @@ class VTuberStudioApp(ctk.CTk):
         self.log(f"[Snapshot] Saved high-res snapshot to {filename}!")
         
     def toggle_recording(self):
-        import cv2
         import os
+        import imageio
         from datetime import datetime
         
         if not self.is_recording:
@@ -414,11 +414,11 @@ class VTuberStudioApp(ctk.CTk):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = os.path.join(SCRIPT_DIR, f"snapshots/recording_{ts}.mp4")
             
-            # Use fixed 512x512 size since that's what we append
-            self.video_writer = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*'mp4v'), 30.0, (512, 512))
-            
-            if not self.video_writer.isOpened():
-                self.log("[Engine] Failed to open VideoWriter!")
+            try:
+                # Use imageio to write universally compatible H.264 MP4s for Discord
+                self.video_writer = imageio.get_writer(filename, fps=30.0, codec='libx264', format='FFMPEG')
+            except Exception as e:
+                self.log(f"[Engine] Failed to open VideoWriter! {e}")
                 return
                 
             self.is_recording = True
@@ -428,7 +428,7 @@ class VTuberStudioApp(ctk.CTk):
             # Stop Recording
             self.is_recording = False
             if self.video_writer is not None:
-                self.video_writer.release()
+                self.video_writer.close()
                 self.video_writer = None
             self.record_btn.configure(text="🔴 Start Recording", fg_color="#d9534f", hover_color="#c9302c")
             self.log("[Engine] Recording saved successfully!")
@@ -440,6 +440,7 @@ class VTuberStudioApp(ctk.CTk):
         import threading
         import cv2
         import os
+        import imageio
         from datetime import datetime
         
         def _do_save():
@@ -451,11 +452,14 @@ class VTuberStudioApp(ctk.CTk):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"snapshots/replay_{ts}.mp4"
             
-            h, w, _ = frames[0].shape
-            out = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*'mp4v'), 10.0, (w, h))
-            for f in frames:
-                out.write(f)
-            out.release()
+            try:
+                # 30 fps replay
+                writer = imageio.get_writer(filename, fps=30.0, codec='libx264', format='FFMPEG')
+                for f in frames:
+                    writer.append_data(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+                writer.close()
+            except Exception as e:
+                self.after(0, lambda: self.log(f"[Replay] Error saving replay: {e}"))
             
             self.after(0, lambda: self.log(f"[Replay] Saved 5-second replay to {filename}!"))
             self.saving = False
