@@ -166,8 +166,7 @@ class VTuberStudioApp(ctk.CTk):
                     dropdown.configure(values=[label_text] + saved)
                     
             dropdown = ctk.CTkOptionMenu(header, values=[label_text] + saved, command=on_select,
-                                         fg_color="transparent", text_color=("black", "white"),
-                                         button_color="transparent", hover_color="#333333")
+                                         text_color=("black", "white"))
             dropdown.set(label_text)
             dropdown.pack(side=ctk.LEFT)
             ctk.CTkButton(header, text="💾", width=30, height=24, fg_color="transparent",
