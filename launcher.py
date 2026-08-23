@@ -490,6 +490,7 @@ class VTuberStudioApp(ctk.CTk):
         self.last_zmq_port = zmq_port
         self.zmq_socket.connect(f"tcp://127.0.0.1:{zmq_port}")
         
+        import zmq
         self.cmd_socket = self.zmq_context.socket(zmq.PUSH)
         self.cmd_socket.connect(f"tcp://127.0.0.1:{cmd_port}")
 
