@@ -65,6 +65,10 @@ class VTuberStudioApp(ctk.CTk):
 
         # Threading for non-blocking save
         self.saving = False
+        
+        # Continuous Recording
+        self.is_recording = False
+        self.video_writer = None
         try:
             os.makedirs(LOG_DIR, exist_ok=True)
             self.log_file = open(os.path.join(LOG_DIR, "launcher-latest.log"),
@@ -255,6 +259,10 @@ class VTuberStudioApp(ctk.CTk):
         self.replay_btn = ctk.CTkButton(self.right_col, text="📷 Save 5s Replay (Ctrl+S)",
                                         command=self.save_replay)
         self.replay_btn.pack(fill=ctk.X, padx=10, pady=5)
+        
+        self.record_btn = ctk.CTkButton(self.right_col, text="🔴 Start Recording",
+                                        command=self.toggle_recording, fg_color="#d9534f", hover_color="#c9302c")
+        self.record_btn.pack(fill=ctk.X, padx=10, pady=5)
 
         self.start_btn = ctk.CTkButton(self.right_col, text="▶ START ENGINE",
                                        fg_color="#28a745", hover_color="#218838",
@@ -320,6 +328,13 @@ class VTuberStudioApp(ctk.CTk):
                         if not self.saving:
                             self.frame_buffer.append(img_np.copy())
                             
+                        # If recording, write it!
+                        if getattr(self, "is_recording", False) and getattr(self, "video_writer", None) is not None:
+                            try:
+                                self.video_writer.write(img_np)
+                            except Exception:
+                                pass
+                              
                         # Fit the preview to the panel instead of a hardcoded
                         # 768px, which overflowed smaller windows.
                         avail = min(max(self.video_frame.winfo_width(), 64),
@@ -357,6 +372,36 @@ class VTuberStudioApp(ctk.CTk):
             cmd = json.dumps({"prompt": chosen})
             self.cmd_socket.send_string(cmd)
             
+    def toggle_recording(self):
+        import cv2
+        import os
+        from datetime import datetime
+        
+        if not self.is_recording:
+            # Start Recording
+            os.makedirs("snapshots", exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(SCRIPT_DIR, f"snapshots/recording_{ts}.mp4")
+            
+            # Use fixed 512x512 size since that's what we append
+            self.video_writer = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*'mp4v'), 30.0, (512, 512))
+            
+            if not self.video_writer.isOpened():
+                self.log("[Engine] Failed to open VideoWriter!")
+                return
+                
+            self.is_recording = True
+            self.record_btn.configure(text="⏹️ Stop Recording", fg_color="#5bc0de", hover_color="#31b0d5")
+            self.log(f"[Engine] Started recording to {filename}...")
+        else:
+            # Stop Recording
+            self.is_recording = False
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+            self.record_btn.configure(text="🔴 Start Recording", fg_color="#d9534f", hover_color="#c9302c")
+            self.log("[Engine] Recording saved successfully!")
+
     def save_replay(self):
         if self.saving or len(self.frame_buffer) == 0:
             return
@@ -588,6 +633,11 @@ class VTuberStudioApp(ctk.CTk):
             self.save_settings()
         except Exception:
             pass
+        if getattr(self, "video_writer", None) is not None:
+            try:
+                self.video_writer.release()
+            except Exception:
+                pass
         if self.process is not None:
             self.graceful_stop(self.process)
         try:
