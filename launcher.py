@@ -115,6 +115,9 @@ class VTuberStudioApp(ctk.CTk):
             "ai_strength": self.strength_var.get(),
             "freeze": self.freeze_var.get(),
             "motion_smoothing": self.motion_var.get(),
+            "bokeh_blur": self.bokeh_var.get(),
+            "normalize_lighting": self.clahe_var.get(),
+            "cuda_graph": self.cudagraph_var.get()
         }
         for e, v in self.expr_vars.items():
             settings[f"expr_{e}"] = v.get()
@@ -269,6 +272,17 @@ class VTuberStudioApp(ctk.CTk):
                          fmt=lambda v: "off" if v < 0.01 else f"{v:.2f}",
                          on_change=_send_motion,
                          desc="Blends frames together for cinematic motion blur. Set to 'off' for raw responsiveness.")
+
+        def _send_bokeh(v):
+            if getattr(self, "cmd_socket", None):
+                try: self.cmd_socket.send_string(json.dumps({"bokeh_blur": float(v)}))
+                except Exception: pass
+
+        self.bokeh_var = ctk.DoubleVar(value=self.settings.get("bokeh_blur", 0.0))
+        self._slider_row(4, "Background Bokeh", self.bokeh_var, 0.0, 1.0, 100,
+                         fmt=lambda v: "off" if v < 0.01 else f"{v:.2f}",
+                         on_change=_send_bokeh,
+                         desc="Artificially blurs the real room behind the AI character (only works if 'Composite Real Background' is checked).")
 
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
@@ -629,6 +643,7 @@ class VTuberStudioApp(ctk.CTk):
             "--t_index", str(strength_to_t_index(self.strength_var.get())),
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",
             "--motion_smoothing", f"{self.motion_var.get():.2f}",
+            "--bokeh_blur", f"{self.bokeh_var.get():.2f}",
             "--expr_overrides", json.dumps({e: v.get() for e, v in self.expr_vars.items()}),
             "--zmq_port", str(zmq_port),
             "--cmd_port", str(cmd_port)

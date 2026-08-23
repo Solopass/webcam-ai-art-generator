@@ -482,6 +482,11 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                     out_frame = (out_frame.astype(np.float32) * alpha + bg_img_cache.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
                 elif args.composite:
                     bg_to_use = cv2.cvtColor(original_frame_rgb, cv2.COLOR_RGB2BGR)
+                    bokeh = state_dict.get("bokeh_blur", args.bokeh_blur)
+                    if bokeh > 0.01:
+                        blur_kernel = int(bokeh * 40)
+                        if blur_kernel % 2 == 0: blur_kernel += 1
+                        bg_to_use = cv2.GaussianBlur(bg_to_use, (blur_kernel, blur_kernel), 0)
                     out_frame = (out_frame.astype(np.float32) * alpha + bg_to_use.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
             
             target_frame = out_frame.astype(np.float32)
@@ -577,6 +582,7 @@ def build_args():
     parser.add_argument("--delta", type=float, default=1.0)
     parser.add_argument("--freeze_threshold", type=float, default=0.98)
     parser.add_argument("--motion_smoothing", type=float, default=0.6)
+    parser.add_argument("--bokeh_blur", type=float, default=0.0)
     parser.add_argument("--expr_overrides", type=str, default="{}")
     parser.add_argument("--t_index", type=int, default=32,
                         help="Denoise start step out of 50. Lower = more AI "
@@ -668,6 +674,9 @@ def cmd_listener_thread(port, state_dict):
                     if "motion_smoothing" in cmd:
                         state_dict["motion_smoothing"] = cmd["motion_smoothing"]
                         log(f"[Engine] Motion Smoothing: {cmd['motion_smoothing']}")
+                    if "bokeh_blur" in cmd:
+                        state_dict["bokeh_blur"] = cmd["bokeh_blur"]
+                        log(f"[Engine] Bokeh Blur: {cmd['bokeh_blur']}")
                     if "expr_override" in cmd:
                         if "expr_overrides" not in state_dict:
                             state_dict["expr_overrides"] = {}
