@@ -76,7 +76,11 @@ def log_environment(args):
     log("--- environment ---")
     log(f"argv: {' '.join(sys.argv[1:])}")
     log(f"python: {sys.version.split()[0]}  platform: {sys.platform}")
-    for mod in ("torch", "diffusers", "tensorrt", "cv2", "mediapipe", "zmq"):
+    # numpy and onnxruntime are here for a reason: a numpy 2.x / onnxruntime
+    # mismatch breaks the ONNX export, and you only find out ~15 minutes into an
+    # engine rebuild. This line tells you before you start.
+    for mod in ("torch", "numpy", "diffusers", "tensorrt", "onnxruntime",
+                "cv2", "mediapipe", "zmq"):
         try:
             m = __import__(mod)
             log(f"{mod}: {getattr(m, '__version__', '?')}")
@@ -117,9 +121,12 @@ def _signal_handler(signum, _frame):
 
 
 def install_signal_handlers():
-    """Windows TerminateProcess cannot be caught, so launcher.py sends
-    CTRL_BREAK_EVENT instead and this is what makes the shutdown path (camera
-    release, virtual camera close) actually run."""
+    """Clean shutdown for console runs (Ctrl-C, SIGTERM from a shell,
+    smoke_test.py).
+
+    The GUI does NOT rely on this: it is spawned with CREATE_NO_WINDOW, and
+    console control events cannot be delivered to a process with no console.
+    That path uses the ZMQ command channel — see cmd_listener_thread."""
     import signal
     for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
         sig = getattr(signal, name, None)
@@ -135,6 +142,9 @@ class ThreadedCamera:
     def __init__(self, src=0, mock=False):
         self.capture = None
         self.is_mock = False
+        self.is_screen = False
+        self.sct = None
+        self.monitor = None
         self.frame_counter = 0
         self.new_frame_event = threading.Event()
         self.status = False
@@ -142,6 +152,8 @@ class ThreadedCamera:
 
         if mock:
             self._become_mock()
+        elif str(src).lower() == "screen":
+            self._become_screen()
         else:
             if isinstance(src, int) and sys.platform == "win32":
                 self.capture = cv2.VideoCapture(src, cv2.CAP_DSHOW)
@@ -167,7 +179,7 @@ class ThreadedCamera:
                     self.capture.release()
                     self.capture = None
 
-        self.running = self.is_mock or self.capture is not None
+        self.running = self.is_mock or self.is_screen or self.capture is not None
         self.thread = None
         if self.running:
             self.thread = threading.Thread(target=self.update, daemon=True)
@@ -183,10 +195,27 @@ class ThreadedCamera:
         base = np.repeat(gx[None, :], 480, axis=0)
         self.frame = cv2.merge((base, base[::-1], np.full_like(base, 128)))
 
+    def _become_screen(self):
+        log("[Camera] Capturing Screen (Desktop) instead of a webcam.")
+        import mss
+        self.is_screen = True
+        self.sct = mss.mss()
+        self.monitor = self.sct.monitors[1]
+        self.status = True
+        self.frame = np.array(self.sct.grab(self.monitor))[:, :, :3]
+
     def update(self):
         while self.running and not STOP.is_set():
             if self.is_mock:
                 self.frame = np.roll(self.frame, 5, axis=1)
+                self.frame_counter += 1
+                self.new_frame_event.set()
+                time.sleep(0.033)
+            elif self.is_screen:
+                import numpy as np
+                sct_img = self.sct.grab(self.monitor)
+                self.frame = np.array(sct_img)[:, :, :3]
+                self.status = True
                 self.frame_counter += 1
                 self.new_frame_event.set()
                 time.sleep(0.033)
@@ -208,7 +237,7 @@ class ThreadedCamera:
         return self.status, self.frame, self.frame_counter
 
     def isOpened(self):
-        return self.is_mock or (self.capture is not None and self.capture.isOpened())
+        return self.is_mock or self.is_screen or (self.capture is not None and self.capture.isOpened())
 
     def release(self):
         self.running = False
@@ -224,6 +253,8 @@ class ThreadedCamera:
                 return
         if self.capture is not None:
             self.capture.release()
+        if getattr(self, "sct", None) is not None:
+            self.sct.close()
 
 
 def scan_cameras(limit=6):
@@ -235,23 +266,6 @@ def scan_cameras(limit=6):
         cap.release()
     return found
 
-
-# --------------------------------------------------------------- helpers ----
-def color_transfer(source_bgr, target_bgr):
-    """Reinhard transfer — pins the AI output to a stable palette so it stops
-    strobing between frames."""
-    src_lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    tgt_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    src_mean, src_std = cv2.meanStdDev(src_lab)
-    tgt_mean, tgt_std = cv2.meanStdDev(tgt_lab)
-    tgt_std = np.where(tgt_std < 1e-5, 1e-5, tgt_std)
-
-    chans = []
-    for c in range(3):
-        ch = (tgt_lab[:, :, c] - tgt_mean[c][0]) * (src_std[c][0] / tgt_std[c][0]) + src_mean[c][0]
-        chans.append(np.clip(ch, 0, 255))
-    return cv2.cvtColor(cv2.merge(chans).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
 # ---------------------------------------------------------- camera thread ----
@@ -274,6 +288,9 @@ def camera_thread(cap, args):
 
     current_x = current_y = target_x = target_y = -1
     prev_input = None
+    mouth_open_state = False
+    smiling_state = False
+    eyes_closed_state = False
     clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)) if args.normalize_lighting else None
 
     for _ in range(4):  # warm up the capture device
@@ -346,8 +363,13 @@ def camera_thread(cap, args):
                     # AI Green Screen: Isolate the character on a neutral dark gray background 
                     # before sending it to the AI. This stops the AI from hallucinating 
                     # the real room into the generated image. Dark gray blends better in latent space.
-                    alpha = soft_mask[..., np.newaxis]
-                    frame_rgb = (frame_rgb * alpha + np.array([64, 64, 64]) * (1.0 - alpha)).astype(np.uint8)
+                    # float32 throughout: the int64 literal used to promote the
+                    # whole expression to float64, which is measurably slower on
+                    # a 512x512x3 frame for identical output.
+                    alpha = soft_mask[..., np.newaxis].astype(np.float32)
+                    grey = np.float32(64.0)
+                    frame_rgb = (frame_rgb.astype(np.float32) * alpha
+                                 + grey * (1.0 - alpha)).astype(np.uint8)
             except Exception as e:
                 log(f"[Camera] Segmentation failed ({e}); compositing the full AI frame.")
                 soft_mask = None
@@ -363,22 +385,39 @@ def camera_thread(cap, args):
                     mouth_bottom = np.array([landmarks[14].x, landmarks[14].y])
                     mouth_open = np.linalg.norm(mouth_top - mouth_bottom)
                     
-                    if mouth_open > 0.04:
-                        emotions.append("open mouth")
-                    elif mouth_open <= 0.01:
-                        emotions.append("closed mouth")
-                    
+                    # Every threshold below is hysteretic: a single cutoff makes
+                    # the state chatter while you hold still, and each flip
+                    # re-encodes the CLIP prompt in the inference loop. The old
+                    # mouth test also had a dead band between 0.01 and 0.04
+                    # where it emitted neither state, so it cycled through three
+                    # different prompts on the way to your mouth closing.
+                    if mouth_open > (0.030 if mouth_open_state else 0.045):
+                        mouth_open_state = True
+                    elif mouth_open < 0.030:
+                        mouth_open_state = False
+                    emotions.append("open mouth" if mouth_open_state else "closed mouth")
+
                     # Calculate smile (mouth corners moving up relative to center)
                     left_corner = landmarks[61].y
                     right_corner = landmarks[291].y
                     center_lip = landmarks[13].y
-                    if (center_lip - left_corner > 0.015) and (center_lip - right_corner > 0.015):
+                    smile = min(center_lip - left_corner, center_lip - right_corner)
+                    if smile > (0.010 if smiling_state else 0.018):
+                        smiling_state = True
+                    elif smile < 0.010:
+                        smiling_state = False
+                    if smiling_state:
                         emotions.append("smiling")
-                        
+
                     # Calculate blink (left eye: 159, 145 / right eye: 386, 374)
                     left_eye_open = landmarks[145].y - landmarks[159].y
                     right_eye_open = landmarks[374].y - landmarks[386].y
-                    if left_eye_open < 0.015 and right_eye_open < 0.015:
+                    eye_open = max(left_eye_open, right_eye_open)
+                    if eye_open < (0.019 if eyes_closed_state else 0.013):
+                        eyes_closed_state = True
+                    elif eye_open > 0.019:
+                        eyes_closed_state = False
+                    if eyes_closed_state:
                         emotions.append("closed eyes")
             except Exception:
                 pass
@@ -414,6 +453,10 @@ def postprocess_thread(args, zmq_socket, vcam):
     frame_count = 0
     cost = 0.0
     start_time = time.time()
+    # This thread owns `vcam` from here on: it may close and reopen it, so main
+    # must not assume its own reference is still live.
+    vcam_retry_at = 0.0
+    vcam_failures = 0
 
     while not STOP.is_set():
         t0 = time.perf_counter()
@@ -455,6 +498,23 @@ def postprocess_thread(args, zmq_socket, vcam):
         current_smoothed_frame = cv2.addWeighted(target_frame, 0.4, current_smoothed_frame, 0.6, 0)
         display_frame = current_smoothed_frame.astype(np.uint8)
 
+        # One transient send failure used to disable the virtual camera for the
+        # rest of the session — OBS briefly grabbing the device during startup
+        # was enough, and the only sign was a single log line while the GUI
+        # preview carried on working. Reopen it on a cooldown instead.
+        if vcam is None and args.virtual_camera and time.time() >= vcam_retry_at:
+            vcam_retry_at = time.time() + 5.0
+            try:
+                import pyvirtualcam
+                vcam = pyvirtualcam.Camera(width=1024, height=1024, fps=30)
+                log(f"[Engine] Virtual camera reconnected: {vcam.device}")
+                vcam_failures = 0
+            except Exception as e:
+                vcam_failures += 1
+                if vcam_failures in (1, 6, 60):
+                    log(f"[Engine] Virtual camera reconnect failed "
+                        f"(attempt {vcam_failures}): {e}")
+
         if vcam is not None:
             hd = cv2.resize(display_frame, (1024, 1024), interpolation=cv2.INTER_LINEAR)
             try:
@@ -462,7 +522,12 @@ def postprocess_thread(args, zmq_socket, vcam):
                 vcam.sleep_until_next_frame()
             except Exception as e:
                 log(f"[Engine] Virtual camera send failed: {e}")
+                try:
+                    vcam.close()
+                except Exception:
+                    pass
                 vcam = None
+                vcam_retry_at = time.time() + 5.0
 
         if zmq_socket is not None:
             ok, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -472,22 +537,32 @@ def postprocess_thread(args, zmq_socket, vcam):
                 except Exception:
                     pass
         
+        # Measure the work BEFORE the pacing sleep. Including the sleep made
+        # this stat read ~37ms every single time regardless of what the thread
+        # was actually doing, which is worse than having no stat at all.
+        cost += time.perf_counter() - t0
+        frame_count += 1
+
         if vcam is None:
             time.sleep(0.033)
 
-        frame_count += 1
-        if frame_count == 20:
-            cv2.imwrite("test_output.png", display_frame)
-
-        cost += time.perf_counter() - t0
         elapsed = time.time() - start_time
         if elapsed > 10.0 and frame_count:
-            log(f"[Engine] postprocess {cost / frame_count * 1000:.1f}ms/frame "
-                f"(colour lock {'on' if args.color_lock else 'off'}, "
-                f"composite {'on' if args.composite else 'off'})")
+            log(f"[Engine] output {frame_count / elapsed:.1f} fps, "
+                f"{cost / frame_count * 1000:.1f}ms work/frame "
+                f"(composite {'on' if args.composite else 'off'}, "
+                f"smoothing on)")
             start_time = time.time()
             frame_count = 0
             cost = 0.0
+
+    # Close the camera this thread is actually holding, which may not be the
+    # object main was handed if a reconnect happened.
+    if vcam is not None:
+        try:
+            vcam.close()
+        except Exception:
+            pass
 
 # ------------------------------------------------------------------ main ----
 def build_args():
@@ -513,13 +588,11 @@ def build_args():
     # These were being sent by launcher.py but never declared here, so argparse
     # exited with code 2 and the engine died instantly whenever they were on.
     parser.add_argument("--audio_sync", action="store_true")
-    parser.add_argument("--emotion_sync", action="store_true")
     parser.add_argument("--composite", action="store_true",
                         help="Keep the real webcam background and composite the "
                              "AI avatar over it.")
     parser.add_argument("--no_face_track", action="store_true")
     parser.add_argument("--normalize_lighting", action="store_true")
-    parser.add_argument("--no_color_lock", action="store_true")
     parser.add_argument("--temporal_denoise", type=float, default=0.4,
                         help="0 disables. Lower = smoother but laggier input.")
     parser.add_argument("--mock_camera", action="store_true")
@@ -532,7 +605,12 @@ def build_args():
         log(f"[Engine] Ignoring unknown arguments: {' '.join(unknown)}")
 
     args.frame_buffer = 1  # must be 1 for the 1-step LCM TensorRT engine
-    args.color_lock = not args.no_color_lock
+    # NOTE: --no_color_lock and the Reinhard color_transfer() it controlled were
+    # removed. The 2-step/full-CFG output does not strobe the way the 1-step
+    # output did, so the stabiliser was taken out of postprocess_thread — and a
+    # flag that silently controls nothing is exactly how this project lost a day
+    # to three inert sliders. If flicker ever returns, the implementation is in
+    # realtime_video_backup.py and in git history.
     # A background image only makes sense if we are compositing — but only
     # honour one that actually exists. A stale path used to silently switch
     # compositing on and then fall back to the real webcam background, i.e. the
@@ -541,7 +619,9 @@ def build_args():
         args.bg_image = None
     if args.bg_image:
         args.composite = True
-    args.t_index = max(0, min(49, args.t_index))
+    # Floor of 2, not 0: the two-step schedule needs room for a distinct first
+    # step below t_index. The GUI never sends below 12.
+    args.t_index = max(2, min(49, args.t_index))
     return args
 
 
@@ -551,21 +631,45 @@ def cmd_listener_thread(port, state_dict):
     import time
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
+    socket.setsockopt(zmq.LINGER, 0)
     socket.bind(f"tcp://127.0.0.1:{port}")
-    while not STOP.is_set():
-        try:
-            msg = socket.recv_string(flags=zmq.NOBLOCK)
+    try:
+        while not STOP.is_set():
             try:
-                cmd = json.loads(msg)
-                if "prompt" in cmd:
-                    state_dict["base_prompt"] = cmd["prompt"]
-                    state_dict["prompt_dirty"] = True
-                    log(f"[Engine] Dynamic Prompt: {cmd['prompt']}")
-            except Exception as e:
-                log(f"[Engine] Bad command: {e}")
-        except zmq.Again:
+                msg = socket.recv_string(flags=zmq.NOBLOCK)
+                try:
+                    cmd = json.loads(msg)
+                    if cmd.get("cmd") == "stop":
+                        # The graceful shutdown path. CTRL_BREAK_EVENT cannot
+                        # reach a process spawned with CREATE_NO_WINDOW (there
+                        # is no console attached), so every STOP used to sit
+                        # through an 8s timeout and then get TerminateProcess'd
+                        # with exit code 1. This channel already exists, needs
+                        # no console, and lands in well under a second.
+                        log("[Engine] Stop requested by the launcher.")
+                        STOP.set()
+                        break
+                    if "negative_prompt" in cmd:
+                        if cmd["negative_prompt"] != state_dict["negative_prompt"]:
+                            state_dict["negative_prompt"] = cmd["negative_prompt"]
+                            state_dict["prompt_dirty"] = True
+                            log(f"[Engine] Negative Prompt: {cmd['negative_prompt']}")
+                    if "prompt" in cmd:
+                        if cmd["prompt"] != state_dict["base_prompt"]:
+                            state_dict["base_prompt"] = cmd["prompt"]
+                            state_dict["prompt_dirty"] = True
+                            log(f"[Engine] Prompt: {cmd['prompt']}")
+                except Exception as e:
+                    log(f"[Engine] Bad command: {e}")
+            except zmq.Again:
+                pass
+            time.sleep(0.05)
+    finally:
+        try:
+            socket.close(linger=0)
+            context.term()
+        except Exception:
             pass
-        time.sleep(0.05)
 
 
 def main():
@@ -616,7 +720,11 @@ def main():
 
     # Use 2-step generation for vastly superior quality compared to 1-step,
     # and standard CFG ("full") to actually enforce the prompt.
-    step1 = max(10, args.t_index - 15)
+    # The extra clamp keeps the list strictly ascending: at a low t_index the
+    # old formula produced e.g. [10, 5], which reverses the noise schedule.
+    # Inside the GUI's slider range (t_index 12-45) this is a no-op.
+    step1 = min(args.t_index - 2, max(10, args.t_index - 15))
+    step1 = max(0, step1)
     t_list = [step1, args.t_index]
     
     stream = StreamDiffusion(
@@ -635,7 +743,9 @@ def main():
     # freshly built TensorRT engine produces noise at 1 step.
     stream.fuse_lora()
 
-    state_dict = {"base_prompt": args.prompt, "prompt_dirty": True}
+    state_dict = {"base_prompt": args.prompt,
+                  "negative_prompt": args.negative_prompt,
+                  "prompt_dirty": True}
     
     if args.cmd_port > 0:
         cmd_t = threading.Thread(target=cmd_listener_thread, args=(args.cmd_port, state_dict), daemon=True)
@@ -709,7 +819,6 @@ def main():
     post_t.start()
 
     log("[Engine] READY — streaming frames.")
-    is_currently_speaking = False
     starved = 0
     nan_frames = 0
     stat_n = 0
@@ -719,7 +828,8 @@ def main():
     stat_start = warmup_until
     
     current_emotions = []
-    
+    embed_shape_warned = False
+
     try:
         while not STOP.is_set():
             t_wait = time.perf_counter()
@@ -742,10 +852,15 @@ def main():
                     STOP.set()
                 continue
 
-            if audio_tracker is not None:
-                if audio_tracker.is_speaking and "open mouth" not in emotions:
-                    # Give precedence to face mesh, but fallback to audio tracker if it hears voice
-                    emotions.append("open mouth")
+            if audio_tracker is not None and audio_tracker.is_speaking:
+                # The face mesh now always emits one of "open mouth"/"closed
+                # mouth", so appending blindly produced a prompt asking for both
+                # at once. Replace rather than add.
+                if "open mouth" not in emotions:
+                    emotions = ["open mouth" if e == "closed mouth" else e
+                                for e in emotions]
+                    if "open mouth" not in emotions:
+                        emotions.append("open mouth")
                     
             if emotions != current_emotions or state_dict["prompt_dirty"]:
                 current_emotions = emotions.copy()
@@ -762,15 +877,32 @@ def main():
                         device=stream.device,
                         num_images_per_prompt=1,
                         do_classifier_free_guidance=True,
-                        negative_prompt=args.negative_prompt,
+                        negative_prompt=state_dict["negative_prompt"],
                     )
-                uncond_embeds = encoder_output[1].repeat(stream.batch_size, 1, 1)
                 cond_embeds = encoder_output[0].repeat(stream.batch_size, 1, 1)
-                new_embeds = torch.cat([uncond_embeds, cond_embeds], dim=0)
-                stream.prompt_embeds.copy_(new_embeds)
-                
-                # Clear cached PyTorch autograd memory from the text encoder pass
-                torch.cuda.empty_cache()
+                # Match whatever prepare() actually built instead of assuming the
+                # [uncond, cond] layout. At guidance_scale exactly 1.0 (the CFG
+                # slider's old minimum) StreamDiffusion disables CFG and
+                # prompt_embeds is half this size, so the assumption made copy_()
+                # raise a shape error and killed the engine on the next prompt
+                # change — one click of the slider away.
+                if stream.prompt_embeds.shape[0] == cond_embeds.shape[0] * 2:
+                    uncond_embeds = encoder_output[1].repeat(stream.batch_size, 1, 1)
+                    new_embeds = torch.cat([uncond_embeds, cond_embeds], dim=0)
+                else:
+                    new_embeds = cond_embeds
+
+                if new_embeds.shape == stream.prompt_embeds.shape:
+                    stream.prompt_embeds.copy_(new_embeds)
+                elif not embed_shape_warned:
+                    embed_shape_warned = True
+                    log(f"[Engine] Prompt update skipped: built "
+                        f"{tuple(new_embeds.shape)} but the pipeline expects "
+                        f"{tuple(stream.prompt_embeds.shape)}.")
+                # No torch.cuda.empty_cache() here: torch.no_grad() above is what
+                # fixed the VRAM leak. empty_cache() is a device-wide sync, and
+                # since a blink flips "closed eyes" in and out of the prompt it
+                # was stalling the loop several times a second.
 
             t_got = time.perf_counter()
             output_image = stream(Image.fromarray(frame_rgb))
@@ -851,8 +983,15 @@ def main():
         cap.release()
         if audio_tracker is not None:
             audio_tracker.close()
+        # postprocess_thread owns vcam and closes its own reference on exit;
+        # this is only a backstop for the case where that thread died. Wrapped
+        # because closing an already-closed camera can raise, and an exception
+        # here would abort the rest of the shutdown.
         if vcam is not None and not post_t.is_alive():
-            vcam.close()
+            try:
+                vcam.close()
+            except Exception:
+                pass
         if zmq_socket is not None and not post_t.is_alive():
             zmq_socket.close(linger=0)
         log("[Engine] Shut down cleanly.")

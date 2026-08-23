@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 
 import customtkinter as ctk
@@ -138,13 +139,24 @@ class VTuberStudioApp(ctk.CTk):
         # --- LEFT: prompting + preview ---
         ctk.CTkLabel(self.left_col, text="Master Prompt:", anchor="w").pack(
             fill=ctk.X, padx=10, pady=(10, 0))
-        self.prompt_entry = ctk.CTkEntry(self.left_col, placeholder_text="Describe your VTuber...")
-        self.prompt_entry.pack(fill=ctk.X, padx=10, pady=5)
+        prompt_row = ctk.CTkFrame(self.left_col, fg_color="transparent")
+        prompt_row.pack(fill=ctk.X, padx=10, pady=5)
+        self.prompt_entry = ctk.CTkEntry(prompt_row, placeholder_text="Describe your VTuber...")
+        self.prompt_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True)
+        self.apply_btn = ctk.CTkButton(prompt_row, text="Apply ⏎", width=86,
+                                       command=self.apply_prompt)
+        self.apply_btn.pack(side=ctk.LEFT, padx=(6, 0))
 
         ctk.CTkLabel(self.left_col, text="Negative Prompt:", anchor="w").pack(
             fill=ctk.X, padx=10, pady=(10, 0))
         self.neg_prompt_entry = ctk.CTkEntry(self.left_col)
         self.neg_prompt_entry.pack(fill=ctk.X, padx=10, pady=5)
+
+        # Pressing Enter in either box pushes the text to a running engine over
+        # the same command channel the randomizer uses. Without this the boxes
+        # were read only once, when the engine was launched.
+        self.prompt_entry.bind("<Return>", lambda e: self.apply_prompt())
+        self.neg_prompt_entry.bind("<Return>", lambda e: self.apply_prompt())
 
         self.video_frame = ctk.CTkFrame(self.left_col, fg_color="black")
         self.video_frame.pack(fill=ctk.BOTH, expand=True, padx=10, pady=10)
@@ -161,7 +173,7 @@ class VTuberStudioApp(ctk.CTk):
 
         ctk.CTkLabel(self.settings_frame, text="Camera Index:", anchor="w").grid(
             row=0, column=0, padx=5, pady=5, sticky="w")
-        self.camera_entry = ctk.CTkEntry(self.settings_frame, width=50)
+        self.camera_entry = ctk.CTkComboBox(self.settings_frame, width=100, values=["0", "1", "screen"])
         self.camera_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
         ctk.CTkLabel(self.settings_frame, text="Character (LoRA):", anchor="w").grid(
@@ -222,8 +234,11 @@ class VTuberStudioApp(ctk.CTk):
         self._slider_row(0, "AI Strength", self.strength_var, 0, 100, 20,
                          fmt=lambda v: f"{int(v)} (step {strength_to_t_index(v)})")
 
-        self.guidance_var = ctk.DoubleVar(value=self.settings.get("guidance", 1.4))
-        self._slider_row(1, "CFG", self.guidance_var, 1.0, 3.0, 20, fmt=lambda v: f"{v:.2f}")
+        # Floor of 1.05, not 1.0: at exactly 1.0 StreamDiffusion disables
+        # classifier-free guidance entirely, which halves the prompt-embed
+        # tensor and changes the UNet batch out from under the built engine.
+        self.guidance_var = ctk.DoubleVar(value=max(1.05, self.settings.get("guidance", 1.4)))
+        self._slider_row(1, "CFG", self.guidance_var, 1.05, 3.0, 20, fmt=lambda v: f"{v:.2f}")
 
         self.freeze_var = ctk.DoubleVar(value=self.settings.get("freeze", 1.0))
         self._slider_row(2, "Freeze", self.freeze_var, 0.90, 1.00, 10,
@@ -301,7 +316,7 @@ class VTuberStudioApp(ctk.CTk):
     def apply_settings(self):
         self.prompt_entry.insert(0, self.settings.get("prompt", ""))
         self.neg_prompt_entry.insert(0, self.settings.get("negative_prompt", ""))
-        self.camera_entry.insert(0, str(self.settings.get("camera", "0")))
+        self.camera_entry.set(str(self.settings.get("camera", "0")))
 
     def toggle_preview(self):
         if self.preview_var.get():
@@ -312,12 +327,19 @@ class VTuberStudioApp(ctk.CTk):
 
     # ------------------------------------------------------------ preview --
     def update_video_frame(self):
-        if self.preview_var.get() and self.process is not None:
+        if getattr(self, "closing", False):
+            return
+
+        # Drain, buffer and record whenever the engine is running — these used
+        # to sit inside the `preview_var` branch, so hiding the preview panel
+        # silently froze an in-progress recording and stopped the replay buffer
+        # filling, with no indication anything had stopped.
+        if self.process is not None:
             import zmq
             import cv2
             import numpy as np
-            from PIL import Image, ImageTk
 
+            img_np = None
             try:
                 latest = None
                 while True:
@@ -325,38 +347,67 @@ class VTuberStudioApp(ctk.CTk):
                         latest = self.zmq_socket.recv(zmq.NOBLOCK)
                     except zmq.Again:
                         break
-
                 if latest:
                     img_np = cv2.imdecode(np.frombuffer(latest, np.uint8), cv2.IMREAD_COLOR)
-                    if img_np is not None:
-                        # Append raw 512x512 frame to our buffer for Replays!
-                        if not self.saving:
-                            self.frame_buffer.append(img_np.copy())
-                            
-                        # If recording, write it!
-                        if getattr(self, "is_recording", False) and getattr(self, "video_writer", None) is not None:
-                            try:
-                                self.video_writer.append_data(cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB))
-                            except Exception:
-                                pass
-                              
+            except Exception:
+                img_np = None
+
+            if img_np is not None:
+                if not self.saving:
+                    self.frame_buffer.append(img_np.copy())
+
+                if self.is_recording and self.video_writer is not None:
+                    try:
+                        self.video_writer.append_data(cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB))
+                    except Exception as e:
+                        # Don't fail silently: a broken writer means the file
+                        # being produced is garbage.
+                        self.is_recording = False
+                        try:
+                            self.video_writer.close()
+                        except Exception:
+                            pass
+                        self.video_writer = None
+                        self.record_btn.configure(text="🔴 Start Recording",
+                                                  fg_color="#d9534f", hover_color="#c9302c")
+                        self.log(f"[Engine] Recording stopped — writer error: {e}")
+
+                if self.preview_var.get():
+                    try:
+                        from PIL import Image, ImageTk
                         # Fit the preview to the panel instead of a hardcoded
                         # 768px, which overflowed smaller windows.
                         avail = min(max(self.video_frame.winfo_width(), 64),
                                     max(self.video_frame.winfo_height(), 64))
                         side = max(256, min(avail - 8, 900))
-                        img_np = cv2.resize(img_np, (side, side), interpolation=cv2.INTER_AREA)
-                        pil_img = Image.fromarray(cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB))
+                        shown = cv2.resize(img_np, (side, side), interpolation=cv2.INTER_AREA)
+                        pil_img = Image.fromarray(cv2.cvtColor(shown, cv2.COLOR_BGR2RGB))
                         self.current_frame_image = ImageTk.PhotoImage(image=pil_img)
                         self.video_label.configure(image=self.current_frame_image, text="")
-            except Exception:
-                pass
+                    except Exception:
+                        pass
 
         self.after(15, self.update_video_frame)
 
+    def apply_prompt(self, quiet=False):
+        """Push whatever is in the two text boxes to the running engine."""
+        prompt = self.prompt_entry.get().strip()
+        negative = self.neg_prompt_entry.get().strip()
+        if not prompt:
+            self.log("[Prompt] Nothing to apply — the prompt box is empty.")
+            return
+        if self.process is None:
+            if not quiet:
+                self.log("[Prompt] Engine is not running; this will be used on START.")
+            return
+        if self.send_command({"prompt": prompt, "negative_prompt": negative}):
+            if not quiet:
+                self.log(f"[Prompt] Applied: {prompt}")
+        else:
+            self.log("[Prompt] Could not reach the engine — is it still starting up?")
+
     def randomize_prompt(self):
         import random
-        import json
         styles = [
             "cyberpunk neon city, highly detailed, vivid colors",
             "studio ghibli style, lush nature, watercolor, beautiful",
@@ -379,11 +430,9 @@ class VTuberStudioApp(ctk.CTk):
         self.prompt_entry.delete(0, 'end')
         self.prompt_entry.insert(0, chosen)
         self.log(f"[Randomizer] Rolled style: {chosen}")
-        
-        # Send dynamic prompt to engine if running
-        if hasattr(self, "cmd_socket") and self.process is not None:
-            cmd = json.dumps({"prompt": chosen})
-            self.cmd_socket.send_string(cmd)
+
+        # Same path as typing a prompt and pressing Enter.
+        self.apply_prompt(quiet=True)
             
     def take_snapshot(self):
         if len(self.frame_buffer) == 0:
@@ -391,17 +440,19 @@ class VTuberStudioApp(ctk.CTk):
             return
             
         import cv2
-        import os
         from datetime import datetime
-        
-        os.makedirs("snapshots", exist_ok=True)
+
+        out_dir = os.path.join(SCRIPT_DIR, "snapshots")
+        os.makedirs(out_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(SCRIPT_DIR, f"snapshots/snapshot_{ts}.png")
-        
-        # Grab the newest frame
+        filename = os.path.join(out_dir, f"snapshot_{ts}.png")
+
+        # The newest frame off the preview stream. Note this is the engine's
+        # 512x512 output after JPEG transport, not a separate high-resolution
+        # render — the button used to claim otherwise.
         frame = self.frame_buffer[-1]
         cv2.imwrite(filename, frame)
-        self.log(f"[Snapshot] Saved high-res snapshot to {filename}!")
+        self.log(f"[Snapshot] Saved {frame.shape[1]}x{frame.shape[0]} snapshot to {filename}")
         
     def toggle_recording(self):
         import os
@@ -410,9 +461,10 @@ class VTuberStudioApp(ctk.CTk):
         
         if not self.is_recording:
             # Start Recording
-            os.makedirs("snapshots", exist_ok=True)
+            out_dir = os.path.join(SCRIPT_DIR, "snapshots")
+            os.makedirs(out_dir, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = os.path.join(SCRIPT_DIR, f"snapshots/recording_{ts}.mp4")
+            filename = os.path.join(out_dir, f"recording_{ts}.mp4")
             
             try:
                 # Use imageio to write universally compatible H.264 MP4s for Discord
@@ -436,34 +488,37 @@ class VTuberStudioApp(ctk.CTk):
     def save_replay(self):
         if self.saving or len(self.frame_buffer) == 0:
             return
-            
-        import threading
+        # Claim the flag on the GUI thread. Setting it inside the worker left a
+        # window where two quick Ctrl+S presses started two writers on the same
+        # buffer.
+        self.saving = True
+
         import cv2
-        import os
         import imageio
         from datetime import datetime
-        
+
         def _do_save():
-            self.saving = True
-            frames = list(self.frame_buffer)
-            self.after(0, lambda: self.log(f"[Replay] Saving {len(frames)} frames to disk..."))
-            
-            os.makedirs("snapshots", exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"snapshots/replay_{ts}.mp4"
-            
             try:
-                # 30 fps replay
+                frames = list(self.frame_buffer)
+                self.after(0, self.log, f"[Replay] Saving {len(frames)} frames to disk...")
+
+                out_dir = os.path.join(SCRIPT_DIR, "snapshots")
+                os.makedirs(out_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = os.path.join(out_dir, f"replay_{ts}.mp4")
+
                 writer = imageio.get_writer(filename, fps=30.0, codec='libx264', format='FFMPEG')
                 for f in frames:
                     writer.append_data(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
                 writer.close()
+                self.after(0, self.log, f"[Replay] Saved replay to {filename}")
             except Exception as e:
-                self.after(0, lambda: self.log(f"[Replay] Error saving replay: {e}"))
-            
-            self.after(0, lambda: self.log(f"[Replay] Saved 5-second replay to {filename}!"))
-            self.saving = False
-            
+                self.after(0, self.log, f"[Replay] Error saving replay: {e}")
+            finally:
+                # Always release the flag, otherwise one failed save stops the
+                # replay buffer refilling for the rest of the session.
+                self.saving = False
+
         threading.Thread(target=_do_save, daemon=True).start()
 
     # -------------------------------------------------------------- logic --
@@ -515,7 +570,7 @@ class VTuberStudioApp(ctk.CTk):
             "--negative_prompt", self.neg_prompt_entry.get(),
             "--camera", self.camera_entry.get().strip() or "0",
             "--lora", self.lora_var.get(),
-            "--guidance_scale", f"{self.guidance_var.get():.3f}",
+            "--guidance_scale", f"{max(1.05, self.guidance_var.get()):.3f}",
             "--t_index", str(strength_to_t_index(self.strength_var.get())),
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",
             "--zmq_port", str(zmq_port),
@@ -578,14 +633,18 @@ class VTuberStudioApp(ctk.CTk):
         
         import zmq
         self.cmd_socket = self.zmq_context.socket(zmq.PUSH)
+        # LINGER 0 and an explicit close on shutdown: an open socket blocks
+        # context teardown indefinitely.
+        self.cmd_socket.setsockopt(zmq.LINGER, 0)
+        self.cmd_socket.setsockopt(zmq.SNDTIMEO, 0)
         self.cmd_socket.connect(f"tcp://127.0.0.1:{cmd_port}")
 
         cmd = self.build_command(zmq_port, cmd_port)
         creationflags = 0
         if sys.platform == "win32":
-            # NEW_PROCESS_GROUP is what makes CTRL_BREAK_EVENT deliverable, so
-            # STOP can shut the engine down gracefully instead of having
-            # TerminateProcess kill it with the webcam still held open.
+            # No console window. Shutdown goes over the ZMQ command channel,
+            # not console control events — those cannot reach a process that
+            # has no console.
             creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
         try:
@@ -623,11 +682,35 @@ class VTuberStudioApp(ctk.CTk):
             self.log(f"=== Engine exited with code {code} (see the error above) ===")
         else:
             self.log("=== Engine Shut Down ===")
+        # Close the command socket for the run that just ended, so sockets do
+        # not accumulate across start/stop cycles and cannot wedge teardown.
+        if getattr(self, "cmd_socket", None) is not None:
+            try:
+                self.cmd_socket.close(linger=0)
+            except Exception:
+                pass
+            self.cmd_socket = None
+        if getattr(self, "closing", False):
+            return
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.video_label.configure(image="", text="Engine stopped.")
         self.current_frame_image = None
         self.process = None
+
+    def send_command(self, payload):
+        """Fire-and-forget a JSON command at the engine. NOBLOCK so a dead or
+        unreachable engine can never stall the Tk main loop."""
+        import json
+        import zmq
+        sock = getattr(self, "cmd_socket", None)
+        if sock is None:
+            return False
+        try:
+            sock.send_string(json.dumps(payload), flags=zmq.NOBLOCK)
+            return True
+        except Exception:
+            return False
 
     def stop_script(self):
         if self.process is None:
@@ -635,22 +718,24 @@ class VTuberStudioApp(ctk.CTk):
         self.log("Shutting down engine...")
         self.stop_btn.configure(state="disabled")
         proc = self.process
-        threading.Thread(target=self.graceful_stop, args=(proc,), daemon=True).start()
+        # Send from the GUI thread: it is non-blocking and gets the request in
+        # before the worker thread starts its wait.
+        self.send_command({"cmd": "stop"})
+        threading.Thread(target=self.graceful_stop, args=(proc, None), daemon=True).start()
 
     @staticmethod
-    def graceful_stop(proc):
-        """Ask first, then insist. The polite signal lets the engine release the
-        webcam and close the virtual camera; TerminateProcess does not."""
-        import signal
+    def graceful_stop(proc, _unused=None):
+        """Ask over the command channel first, then insist.
+
+        This used to send CTRL_BREAK_EVENT, which cannot be delivered to a
+        process created with CREATE_NO_WINDOW — no console is attached. The
+        signal never arrived, so every stop sat through the full timeout and
+        then hit TerminateProcess, which exits with code 1 and made the GUI
+        report a phantom error on every single shutdown. The caller has already
+        sent {"cmd": "stop"} over ZMQ, which needs no console at all.
+        """
         try:
-            if sys.platform == "win32":
-                proc.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=8)
+            proc.wait(timeout=6)
             return
         except subprocess.TimeoutExpired:
             pass
@@ -664,22 +749,60 @@ class VTuberStudioApp(ctk.CTk):
                 pass
 
     def on_closing(self):
+        # Re-entrancy guard: the window stays up while we wait for the engine,
+        # so the user can (and will) click X again.
+        if getattr(self, "closing", False):
+            return
+        self.closing = True
+
         try:
             self.save_settings()
         except Exception:
             pass
+
+        # imageio writers have close(), not release(). The AttributeError was
+        # swallowed and the in-progress MP4 was never finalised, so quitting
+        # mid-recording left a corrupt file.
+        self.is_recording = False
         if getattr(self, "video_writer", None) is not None:
             try:
-                self.video_writer.release()
+                self.video_writer.close()
             except Exception:
                 pass
+            self.video_writer = None
+
         if self.process is not None:
-            self.graceful_stop(self.process)
+            self.log("Closing — shutting the engine down...")
+            self.send_command({"cmd": "stop"})
+            threading.Thread(target=self.graceful_stop,
+                             args=(self.process, None), daemon=True).start()
+            self._finish_closing(deadline=time.time() + 8.0)
+        else:
+            self._finish_closing(deadline=0)
+
+    def _finish_closing(self, deadline):
+        """Wait for the engine without freezing the window, then tear down."""
+        proc = self.process
+        if proc is not None and proc.poll() is None and time.time() < deadline:
+            self.after(100, self._finish_closing, deadline)
+            return
+
+        for sock in (getattr(self, "cmd_socket", None), self.zmq_socket):
+            if sock is not None:
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+        self.cmd_socket = None
         try:
-            self.zmq_socket.close(linger=0)
-            self.zmq_context.term()
+            # destroy() closes any socket still open in the context and then
+            # terminates it. Plain term() blocks forever on an unclosed socket,
+            # and cmd_socket was never being closed — which is why the window
+            # refused to go away once the engine had been started.
+            self.zmq_context.destroy(linger=0)
         except Exception:
             pass
+
         if self.log_file:
             try:
                 self.log_file.close()
