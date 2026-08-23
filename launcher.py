@@ -56,6 +56,15 @@ class VTuberStudioApp(ctk.CTk):
         self.process = None
         self.current_frame_image = None
         self.log_file = None
+        import collections
+        self.frame_buffer = collections.deque(maxlen=50)
+
+        # Global Keybinds
+        self.bind("<Control-s>", lambda e: self.save_replay())
+        self.bind("<Control-r>", lambda e: self.randomize_prompt())
+
+        # Threading for non-blocking save
+        self.saving = False
         try:
             os.makedirs(LOG_DIR, exist_ok=True)
             self.log_file = open(os.path.join(LOG_DIR, "launcher-latest.log"),
@@ -239,6 +248,14 @@ class VTuberStudioApp(ctk.CTk):
         self.zmq_socket.setsockopt(zmq.CONFLATE, 1)
         self.zmq_socket.setsockopt(zmq.LINGER, 0)
 
+        self.random_btn = ctk.CTkButton(self.right_col, text="🎲 Randomize Style (Ctrl+R)",
+                                        command=self.randomize_prompt)
+        self.random_btn.pack(fill=ctk.X, padx=10, pady=5)
+        
+        self.replay_btn = ctk.CTkButton(self.right_col, text="📷 Save 5s Replay (Ctrl+S)",
+                                        command=self.save_replay)
+        self.replay_btn.pack(fill=ctk.X, padx=10, pady=5)
+
         self.start_btn = ctk.CTkButton(self.right_col, text="▶ START ENGINE",
                                        fg_color="#28a745", hover_color="#218838",
                                        command=self.start_script)
@@ -299,6 +316,10 @@ class VTuberStudioApp(ctk.CTk):
                 if latest:
                     img_np = cv2.imdecode(np.frombuffer(latest, np.uint8), cv2.IMREAD_COLOR)
                     if img_np is not None:
+                        # Append raw 512x512 frame to our buffer for Replays!
+                        if not self.saving:
+                            self.frame_buffer.append(img_np.copy())
+                            
                         # Fit the preview to the panel instead of a hardcoded
                         # 768px, which overflowed smaller windows.
                         avail = min(max(self.video_frame.winfo_width(), 64),
@@ -312,6 +333,58 @@ class VTuberStudioApp(ctk.CTk):
                 pass
 
         self.after(15, self.update_video_frame)
+
+    def randomize_prompt(self):
+        import random
+        import json
+        styles = [
+            "cyberpunk neon city, highly detailed, vivid colors",
+            "studio ghibli style, lush nature, watercolor, beautiful",
+            "grimdark fantasy, gothic, bloodborne, masterpiece",
+            "synthwave retrowave 80s, glowing grids",
+            "oil painting, classical portrait, rembrandt lighting",
+            "wizard with a castle background, fantasy",
+            "steampunk inventor workshop, gears, copper",
+            "space astronaut on an alien planet, glowing flora"
+        ]
+        chosen = random.choice(styles)
+        self.prompt_entry.delete(0, 'end')
+        self.prompt_entry.insert(0, chosen)
+        self.log(f"[Randomizer] Rolled style: {chosen}")
+        
+        # Send dynamic prompt to engine if running
+        if hasattr(self, "cmd_socket") and self.process is not None:
+            cmd = json.dumps({"prompt": chosen})
+            self.cmd_socket.send_string(cmd)
+            
+    def save_replay(self):
+        if self.saving or len(self.frame_buffer) == 0:
+            return
+            
+        import threading
+        import cv2
+        import os
+        from datetime import datetime
+        
+        def _do_save():
+            self.saving = True
+            frames = list(self.frame_buffer)
+            self.log(f"[Replay] Saving {len(frames)} frames to disk...")
+            
+            os.makedirs("snapshots", exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"snapshots/replay_{ts}.mp4"
+            
+            h, w, _ = frames[0].shape
+            out = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*'mp4v'), 10.0, (w, h))
+            for f in frames:
+                out.write(f)
+            out.release()
+            
+            self.log(f"[Replay] Saved 5-second replay to {filename}!")
+            self.saving = False
+            
+        threading.Thread(target=_do_save, daemon=True).start()
 
     # -------------------------------------------------------------- logic --
     def log(self, message):
@@ -348,7 +421,7 @@ class VTuberStudioApp(ctk.CTk):
         self.log("venv not found — falling back to the interpreter running this GUI.")
         return sys.executable
 
-    def build_command(self, zmq_port):
+    def build_command(self, zmq_port, cmd_port):
         cmd = [
             self.python_executable(), "-u",
             os.path.join(SCRIPT_DIR, "realtime_video.py"),
@@ -359,9 +432,9 @@ class VTuberStudioApp(ctk.CTk):
             "--guidance_scale", f"{self.guidance_var.get():.3f}",
             "--t_index", str(strength_to_t_index(self.strength_var.get())),
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",
+            "--zmq_port", str(zmq_port),
+            "--cmd_port", str(cmd_port)
         ]
-        if zmq_port:
-            cmd += ["--zmq_port", str(zmq_port)]
         if self.mirror_var.get():
             cmd.append("--mirror_camera")
         if self.vcam_var.get():
@@ -397,16 +470,30 @@ class VTuberStudioApp(ctk.CTk):
         sock.bind(("127.0.0.1", 0))
         zmq_port = sock.getsockname()[1]
         sock.close()
+        
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        cmd_port = sock.getsockname()[1]
+        sock.close()
 
         if getattr(self, "last_zmq_port", None):
             try:
                 self.zmq_socket.disconnect(f"tcp://127.0.0.1:{self.last_zmq_port}")
             except Exception:
                 pass
+        if getattr(self, "cmd_socket", None):
+            try:
+                self.cmd_socket.close()
+            except Exception:
+                pass
+                
         self.last_zmq_port = zmq_port
         self.zmq_socket.connect(f"tcp://127.0.0.1:{zmq_port}")
+        
+        self.cmd_socket = self.zmq_context.socket(zmq.PUSH)
+        self.cmd_socket.connect(f"tcp://127.0.0.1:{cmd_port}")
 
-        cmd = self.build_command(zmq_port)
+        cmd = self.build_command(zmq_port, cmd_port)
         creationflags = 0
         if sys.platform == "win32":
             # NEW_PROCESS_GROUP is what makes CTRL_BREAK_EVENT deliverable, so

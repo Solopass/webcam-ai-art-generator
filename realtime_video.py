@@ -503,6 +503,7 @@ def build_args():
     parser.add_argument("--mirror_camera", action="store_true")
     parser.add_argument("--virtual_camera", action="store_true")
     parser.add_argument("--zmq_port", type=int, default=-1)
+    parser.add_argument("--cmd_port", type=int, default=-1)
     parser.add_argument("--bg_image", type=str, default="")
     # These were being sent by launcher.py but never declared here, so argparse
     # exited with code 2 and the engine died instantly whenever they were on.
@@ -530,15 +531,36 @@ def build_args():
     # A background image only makes sense if we are compositing — but only
     # honour one that actually exists. A stale path used to silently switch
     # compositing on and then fall back to the real webcam background, i.e. the
-    # exact opposite of leaving "Keep Real Background" off.
+    # worst of both worlds.
+    if args.bg_image and not os.path.exists(args.bg_image):
+        args.bg_image = None
     if args.bg_image:
-        if os.path.exists(args.bg_image):
-            args.composite = True
-        else:
-            log(f"[Engine] Background image not found: {args.bg_image} — ignoring it.")
-            args.bg_image = ""
+        args.composite = True
     args.t_index = max(0, min(49, args.t_index))
     return args
+
+
+def cmd_listener_thread(port, state_dict):
+    import zmq
+    import json
+    import time
+    context = zmq.Context()
+    socket = context.socket(zmq.PULL)
+    socket.bind(f"tcp://127.0.0.1:{port}")
+    while not STOP.is_set():
+        try:
+            msg = socket.recv_string(flags=zmq.NOBLOCK)
+            try:
+                cmd = json.loads(msg)
+                if "prompt" in cmd:
+                    state_dict["base_prompt"] = cmd["prompt"]
+                    state_dict["prompt_dirty"] = True
+                    log(f"[Engine] Dynamic Prompt: {cmd['prompt']}")
+            except Exception as e:
+                log(f"[Engine] Bad command: {e}")
+        except zmq.Again:
+            pass
+        time.sleep(0.05)
 
 
 def main():
@@ -608,11 +630,17 @@ def main():
     # freshly built TensorRT engine produces noise at 1 step.
     stream.fuse_lora()
 
-    base_prompt = args.prompt
+    state_dict = {"base_prompt": args.prompt, "prompt_dirty": True}
+    
+    if args.cmd_port > 0:
+        cmd_t = threading.Thread(target=cmd_listener_thread, args=(args.cmd_port, state_dict), daemon=True)
+        cmd_t.start()
+        log(f"[Engine] Listening for commands on port {args.cmd_port}")
+
     log(f"[Engine] Preparing (t_index={args.t_index}, cfg={args.cfg_type}, "
         f"guidance={args.guidance_scale}, delta={args.delta})")
     stream.prepare(
-        prompt=base_prompt + (", closed mouth" if args.audio_sync else ""),
+        prompt=state_dict["base_prompt"] + (", closed mouth" if args.audio_sync else ""),
         negative_prompt=args.negative_prompt,
         num_inference_steps=50,
         guidance_scale=args.guidance_scale,
@@ -714,10 +742,11 @@ def main():
                     # Give precedence to face mesh, but fallback to audio tracker if it hears voice
                     emotions.append("open mouth")
                     
-            if emotions != current_emotions:
+            if emotions != current_emotions or state_dict["prompt_dirty"]:
                 current_emotions = emotions.copy()
+                state_dict["prompt_dirty"] = False
                 emotion_str = ", ".join(emotions) if emotions else ""
-                full_prompt = base_prompt + (f", {emotion_str}" if emotion_str else "")
+                full_prompt = state_dict["base_prompt"] + (f", {emotion_str}" if emotion_str else "")
                 
                 # We must encode BOTH positive and negative prompts for cfg_type="full",
                 # and use .copy_() to overwrite the existing tensor in-place.
