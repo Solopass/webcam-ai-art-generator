@@ -62,6 +62,7 @@ class VTuberStudioApp(ctk.CTk):
         # Global Keybinds
         self.bind("<Control-s>", lambda e: self.save_replay())
         self.bind("<Control-r>", lambda e: self.randomize_prompt())
+        self.bind("<F12>", lambda e: self.take_snapshot())
 
         # Threading for non-blocking save
         self.saving = False
@@ -256,6 +257,10 @@ class VTuberStudioApp(ctk.CTk):
                                         command=self.randomize_prompt)
         self.random_btn.pack(fill=ctk.X, padx=10, pady=5)
         
+        self.snapshot_btn = ctk.CTkButton(self.right_col, text="🖼️ Take Snapshot (F12)",
+                                          command=self.take_snapshot)
+        self.snapshot_btn.pack(fill=ctk.X, padx=10, pady=5)
+        
         self.replay_btn = ctk.CTkButton(self.right_col, text="📷 Save 5s Replay (Ctrl+S)",
                                         command=self.save_replay)
         self.replay_btn.pack(fill=ctk.X, padx=10, pady=5)
@@ -360,7 +365,15 @@ class VTuberStudioApp(ctk.CTk):
             "oil painting, classical portrait, rembrandt lighting",
             "wizard with a castle background, fantasy",
             "steampunk inventor workshop, gears, copper",
-            "space astronaut on an alien planet, glowing flora"
+            "space astronaut on an alien planet, glowing flora",
+            "pixar 3D animation style, cute, smooth, rendered in unreal engine",
+            "vaporwave aesthetics, pastel colors, glitch art, palm trees",
+            "pencil sketch, highly detailed, black and white, hatching",
+            "origami paper craft world, colorful, macro photography",
+            "holographic neon glowing avatar, futuristic, sci-fi matrix",
+            "claymation stop motion style, plasticine, highly detailed",
+            "stained glass window portrait, colorful, divine light",
+            "retro 90s anime, vhs aesthetic, cel shading"
         ]
         chosen = random.choice(styles)
         self.prompt_entry.delete(0, 'end')
@@ -372,6 +385,24 @@ class VTuberStudioApp(ctk.CTk):
             cmd = json.dumps({"prompt": chosen})
             self.cmd_socket.send_string(cmd)
             
+    def take_snapshot(self):
+        if len(self.frame_buffer) == 0:
+            self.log("[Engine] No frame available to snapshot yet.")
+            return
+            
+        import cv2
+        import os
+        from datetime import datetime
+        
+        os.makedirs("snapshots", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(SCRIPT_DIR, f"snapshots/snapshot_{ts}.png")
+        
+        # Grab the newest frame
+        frame = self.frame_buffer[-1]
+        cv2.imwrite(filename, frame)
+        self.log(f"[Snapshot] Saved high-res snapshot to {filename}!")
+        
     def toggle_recording(self):
         import cv2
         import os
