@@ -1,0 +1,58 @@
+# Record of the environment this project is KNOWN to work in, captured
+# 2026-08-23 from venv/Lib/site-packages on the RTX 3080 Ti machine.
+#
+# This is a reference, NOT an installer. Do not `pip install -r` this file:
+# torch needs the PyTorch CUDA index, tensorrt comes from NVIDIA's index, and
+# StreamDiffusion is a local editable checkout. Use setup.ps1, which does all
+# three in the right order. This file is here so that when something breaks
+# after an upgrade you can see exactly what changed.
+
+# --- core inference ---
+torch==2.5.1+cu124              # setup.ps1 installs cu121; the working env drifted to cu124
+torchvision==0.20.1+cu124
+diffusers==0.24.0               # pre-PEFT LoRA backend — upgrading changes LoRA semantics
+transformers==4.35.2
+huggingface_hub==0.25.2
+accelerate==1.14.0
+safetensors==0.8.0
+
+# --- TensorRT path ---
+tensorrt==9.0.1.post12.dev4     # --pre --extra-index-url https://pypi.nvidia.com
+tensorrt_bindings==9.0.1.post12.dev4
+tensorrt_libs==9.0.1.post12.dev4
+polygraphy==0.49.26
+onnx==1.15.0
+onnx_graphsurgeon==0.6.1
+onnxruntime==1.16.3             # only used for the ONNX export, i.e. engine rebuilds
+cuda_python==12.9.7
+colored==2.3.2
+omegaconf==2.3.1
+
+# --- numpy: MUST stay below 2 ---
+# numpy 2.x breaks this onnxruntime build (`_ARRAY_API not found`). Harmless
+# while cached engines are reused, fatal the moment you rebuild one.
+numpy==1.26.4
+
+# --- vision / IO ---
+# NOTE: both OpenCV distributions are installed and they ship the same `cv2`
+# package, so whichever was installed last wins. Right now that is contrib
+# 5.0.0.93 (mediapipe pulls it in), NOT the 4.9.0.80 setup.ps1 pins. If cv2
+# behaviour ever looks strange, this is the first thing to check.
+opencv_python==4.9.0.80
+opencv_contrib_python==5.0.0.93
+pillow==12.3.0
+mediapipe==0.10.14
+imageio==2.37.4                 # MP4 recording (libx264, Discord-compatible)
+imageio_ffmpeg==0.6.0
+
+# --- app ---
+customtkinter==6.0.0
+pyzmq==27.2.0                   # preview stream + live prompt command channel
+sounddevice==0.5.6              # audio lip-sync
+pyvirtualcam==0.15.0            # OBS output
+
+# --- not on PyPI ---
+# StreamDiffusion: https://github.com/cumulo-autumn/StreamDiffusion.git @ b623251
+#   cloned into ./StreamDiffusion and installed with `pip install -e .[tensorrt]`
+mss
+imageio[ffmpeg]
