@@ -145,20 +145,47 @@ class VTuberStudioApp(ctk.CTk):
         self.right_col = ctk.CTkScrollableFrame(self.main_frame, width=290)
         self.right_col.pack(side=ctk.RIGHT, fill=ctk.Y)
 
+        def build_prompt_header(label_text, entry_box, settings_key):
+            header = ctk.CTkFrame(self.left_col, fg_color="transparent")
+            header.pack(fill=ctk.X, padx=10, pady=(10, 0))
+            saved = self.settings.get(settings_key, [])
+            
+            def on_select(val):
+                if val != label_text:
+                    entry_box.delete(0, 'end')
+                    entry_box.insert(0, val)
+                    self.apply_prompt()
+                dropdown.set(label_text)
+                
+            def on_save():
+                current = entry_box.get().strip()
+                if current and current not in saved:
+                    saved.append(current)
+                    self.settings[settings_key] = saved
+                    self.save_settings()
+                    dropdown.configure(values=[label_text] + saved)
+                    
+            dropdown = ctk.CTkOptionMenu(header, values=[label_text] + saved, command=on_select,
+                                         fg_color="transparent", text_color=("black", "white"),
+                                         button_color="transparent", hover_color="#333333")
+            dropdown.set(label_text)
+            dropdown.pack(side=ctk.LEFT)
+            ctk.CTkButton(header, text="💾", width=30, height=24, fg_color="transparent",
+                          command=on_save, hover_color="#333333").pack(side=ctk.LEFT, padx=5)
+
         # --- LEFT: prompting + preview ---
-        ctk.CTkLabel(self.left_col, text="Master Prompt:", anchor="w").pack(
-            fill=ctk.X, padx=10, pady=(10, 0))
         prompt_row = ctk.CTkFrame(self.left_col, fg_color="transparent")
-        prompt_row.pack(fill=ctk.X, padx=10, pady=5)
+        
         self.prompt_entry = ctk.CTkEntry(prompt_row, placeholder_text="Describe your VTuber...")
+        build_prompt_header("Master Prompt ▾", self.prompt_entry, "saved_prompts")
+        prompt_row.pack(fill=ctk.X, padx=10, pady=5)
         self.prompt_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True)
         self.apply_btn = ctk.CTkButton(prompt_row, text="Apply ⏎", width=86,
                                        command=self.apply_prompt)
         self.apply_btn.pack(side=ctk.LEFT, padx=(6, 0))
 
-        ctk.CTkLabel(self.left_col, text="Negative Prompt:", anchor="w").pack(
-            fill=ctk.X, padx=10, pady=(10, 0))
         self.neg_prompt_entry = ctk.CTkEntry(self.left_col)
+        build_prompt_header("Negative Prompt ▾", self.neg_prompt_entry, "saved_neg_prompts")
         self.neg_prompt_entry.pack(fill=ctk.X, padx=10, pady=5)
 
         # Pressing Enter in either box pushes the text to a running engine over
@@ -191,10 +218,14 @@ class VTuberStudioApp(ctk.CTk):
         loras = ["None"]
         if os.path.isdir(lora_dir):
             loras += sorted(f for f in os.listdir(lora_dir) if f.endswith(".safetensors"))
+        def on_lora_changed(val):
+            if self.process is not None:
+                self.send_command({"lora": val})
+
         saved_lora = self.settings.get("lora", "None")
         self.lora_var = ctk.StringVar(value=saved_lora if saved_lora in loras else "None")
         self.lora_dropdown = ctk.CTkOptionMenu(self.settings_frame, variable=self.lora_var,
-                                               values=loras, width=140)
+                                               values=loras, width=140, command=on_lora_changed)
         self.lora_dropdown.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
         # Toggles
@@ -698,7 +729,7 @@ class VTuberStudioApp(ctk.CTk):
 
     def _set_ui_state(self, state):
         self.camera_entry.configure(state=state)
-        self.lora_dropdown.configure(state=state)
+        # self.lora_dropdown.configure(state=state) # Kept active for hot-swapping
         self.preview_cb.configure(state=state)
         self.mirror_cb.configure(state=state)
         self.vcam_cb.configure(state=state)
