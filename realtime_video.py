@@ -654,54 +654,49 @@ def cmd_listener_thread(port, state_dict):
     socket.bind(f"tcp://127.0.0.1:{port}")
     try:
         while not STOP.is_set():
-            try:
-                msg = socket.recv_string(flags=zmq.NOBLOCK)
+            while True:
                 try:
-                    cmd = json.loads(msg)
-                    if cmd.get("cmd") == "stop":
-                        # The graceful shutdown path. CTRL_BREAK_EVENT cannot
-                        # reach a process spawned with CREATE_NO_WINDOW (there
-                        # is no console attached), so every STOP used to sit
-                        # through an 8s timeout and then get TerminateProcess'd
-                        # with exit code 1. This channel already exists, needs
-                        # no console, and lands in well under a second.
-                        log("[Engine] Stop requested by the launcher.")
-                        STOP.set()
-                        break
-                    if "negative_prompt" in cmd:
-                        if cmd["negative_prompt"] != state_dict["negative_prompt"]:
-                            state_dict["negative_prompt"] = cmd["negative_prompt"]
+                    msg = socket.recv_string(flags=zmq.NOBLOCK)
+                    try:
+                        cmd = json.loads(msg)
+                        if cmd.get("cmd") == "stop":
+                            log("[Engine] Stop requested by the launcher.")
+                            STOP.set()
+                            break
+                        if "negative_prompt" in cmd:
+                            if cmd["negative_prompt"] != state_dict["negative_prompt"]:
+                                state_dict["negative_prompt"] = cmd["negative_prompt"]
+                                state_dict["prompt_dirty"] = True
+                                log(f"[Engine] Negative Prompt: {cmd['negative_prompt']}")
+                        if "prompt" in cmd:
+                            if cmd["prompt"] != state_dict["base_prompt"]:
+                                state_dict["base_prompt"] = cmd["prompt"]
+                                state_dict["prompt_dirty"] = True
+                                log(f"[Engine] Prompt: {cmd['prompt']}")
+                        if "freeze_threshold" in cmd:
+                            state_dict["freeze_threshold_dirty"] = cmd["freeze_threshold"]
+                            log(f"[Engine] Freeze Threshold: {cmd['freeze_threshold']}")
+                        if "motion_smoothing" in cmd:
+                            state_dict["motion_smoothing"] = cmd["motion_smoothing"]
+                            log(f"[Engine] Motion Smoothing: {cmd['motion_smoothing']}")
+                        if "bokeh_blur" in cmd:
+                            state_dict["bokeh_blur"] = cmd["bokeh_blur"]
+                            log(f"[Engine] Bokeh Blur: {cmd['bokeh_blur']}")
+                        if "expr_override" in cmd:
+                            if "expr_overrides" not in state_dict:
+                                state_dict["expr_overrides"] = {}
+                            state_dict["expr_overrides"].update(cmd["expr_override"])
                             state_dict["prompt_dirty"] = True
-                            log(f"[Engine] Negative Prompt: {cmd['negative_prompt']}")
-                    if "prompt" in cmd:
-                        if cmd["prompt"] != state_dict["base_prompt"]:
-                            state_dict["base_prompt"] = cmd["prompt"]
-                            state_dict["prompt_dirty"] = True
-                            log(f"[Engine] Prompt: {cmd['prompt']}")
-                    if "freeze_threshold" in cmd:
-                        state_dict["freeze_threshold_dirty"] = cmd["freeze_threshold"]
-                        log(f"[Engine] Freeze Threshold: {cmd['freeze_threshold']}")
-                    if "motion_smoothing" in cmd:
-                        state_dict["motion_smoothing"] = cmd["motion_smoothing"]
-                        log(f"[Engine] Motion Smoothing: {cmd['motion_smoothing']}")
-                    if "bokeh_blur" in cmd:
-                        state_dict["bokeh_blur"] = cmd["bokeh_blur"]
-                        log(f"[Engine] Bokeh Blur: {cmd['bokeh_blur']}")
-                    if "expr_override" in cmd:
-                        if "expr_overrides" not in state_dict:
-                            state_dict["expr_overrides"] = {}
-                        state_dict["expr_overrides"].update(cmd["expr_override"])
-                        state_dict["prompt_dirty"] = True
-                        log(f"[Engine] Expression Override: {cmd['expr_override']}")
-                    if "sens_override" in cmd:
-                        if "sens_overrides" not in state_dict:
-                            state_dict["sens_overrides"] = {}
-                        state_dict["sens_overrides"].update(cmd["sens_override"])
-                        log(f"[Engine] Sensitivity Override: {cmd['sens_override']}")
-                except Exception as e:
-                    log(f"[Engine] Bad command: {e}")
-            except zmq.Again:
-                pass
+                            log(f"[Engine] Expression Override: {cmd['expr_override']}")
+                        if "sens_override" in cmd:
+                            if "sens_overrides" not in state_dict:
+                                state_dict["sens_overrides"] = {}
+                            state_dict["sens_overrides"].update(cmd["sens_override"])
+                            log(f"[Engine] Sensitivity Override: {cmd['sens_override']}")
+                    except Exception as e:
+                        log(f"[Engine] Bad command: {e}")
+                except zmq.Again:
+                    break
             time.sleep(0.05)
     finally:
         try:

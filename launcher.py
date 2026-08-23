@@ -199,36 +199,41 @@ class VTuberStudioApp(ctk.CTk):
 
         # Toggles
         self.preview_var = ctk.BooleanVar(value=self.settings.get("embedded_preview", True))
-        ctk.CTkSwitch(self.right_col, text="Embedded Preview", variable=self.preview_var,
-                      command=self.toggle_preview).pack(anchor="w", padx=15, pady=4)
+        self.preview_cb = ctk.CTkSwitch(self.right_col, text="Embedded Video Preview",
+                                        command=self.toggle_preview, variable=self.preview_var)
+        self.preview_cb.pack(anchor="w", padx=15, pady=4)
 
         self.mirror_var = ctk.BooleanVar(value=self.settings.get("mirror_camera", True))
-        ctk.CTkSwitch(self.right_col, text="Mirror Camera (Flip)",
-                      variable=self.mirror_var).pack(anchor="w", padx=15, pady=4)
+        self.mirror_cb = ctk.CTkSwitch(self.right_col, text="Mirror Camera",
+                                       variable=self.mirror_var)
+        self.mirror_cb.pack(anchor="w", padx=15, pady=4)
 
         self.vcam_var = ctk.BooleanVar(value=self.settings.get("virtual_camera", False))
-        ctk.CTkSwitch(self.right_col, text="OBS Virtual Camera",
-                      variable=self.vcam_var).pack(anchor="w", padx=15, pady=4)
+        self.vcam_cb = ctk.CTkSwitch(self.right_col, text="OBS Virtual Camera",
+                                     variable=self.vcam_var)
+        self.vcam_cb.pack(anchor="w", padx=15, pady=4)
 
         self.audio_var = ctk.BooleanVar(value=self.settings.get("audio_sync", False))
-        ctk.CTkSwitch(self.right_col, text="Audio Lip-Sync (FFT)",
-                      variable=self.audio_var).pack(anchor="w", padx=15, pady=4)
+        self.audio_cb = ctk.CTkSwitch(self.right_col, text="Audio Lip-Sync (FFT)",
+                                      variable=self.audio_var)
+        self.audio_cb.pack(anchor="w", padx=15, pady=4)
 
         self.bg_keep_var = ctk.BooleanVar(value=self.settings.get("keep_background", False))
-        ctk.CTkSwitch(self.right_col, text="Keep Real Background",
-                      variable=self.bg_keep_var).pack(anchor="w", padx=15, pady=4)
+        self.bg_keep_cb = ctk.CTkSwitch(self.right_col, text="Keep Real Background",
+                                        variable=self.bg_keep_var)
+        self.bg_keep_cb.pack(anchor="w", padx=15, pady=4)
 
         # Background image
         self.bg_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
         self.bg_frame.pack(fill=ctk.X, padx=10, pady=(5, 0))
         ctk.CTkLabel(self.bg_frame, text="BG:", anchor="w").pack(side=ctk.LEFT, padx=5)
         self.bg_var = ctk.StringVar(value=self.settings.get("bg_image", ""))
-        ctk.CTkEntry(self.bg_frame, textvariable=self.bg_var, width=100).pack(
-            side=ctk.LEFT, padx=5, fill=ctk.X, expand=True)
-        ctk.CTkButton(self.bg_frame, text="...", command=self.select_bg, width=30).pack(
-            side=ctk.LEFT, padx=(0, 2))
-        ctk.CTkButton(self.bg_frame, text="x", command=lambda: self.bg_var.set(""),
-                      width=24, fg_color="#555555", hover_color="#777777").pack(side=ctk.LEFT)
+        self.bg_entry = ctk.CTkEntry(self.bg_frame, textvariable=self.bg_var, width=150)
+        self.bg_entry.pack(side=ctk.LEFT, padx=5)
+        self.bg_btn = ctk.CTkButton(self.bg_frame, text="Browse", width=60, command=self.select_bg)
+        self.bg_btn.pack(side=ctk.LEFT, padx=(0, 5))
+        self.bg_clear_btn = ctk.CTkButton(self.bg_frame, text="X", width=20, command=lambda: self.bg_var.set(""))
+        self.bg_clear_btn.pack(side=ctk.LEFT)
 
         # --- Advanced tuning ---
         ctk.CTkLabel(self.right_col, text="Advanced Tuning:", anchor="w",
@@ -287,12 +292,14 @@ class VTuberStudioApp(ctk.CTk):
                          desc="Artificially blurs the real room behind the AI character (only works if 'Composite Real Background' is checked).")
 
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
-        ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
-                      variable=self.clahe_var).pack(anchor="w", padx=15, pady=(8, 4))
+        self.clahe_cb = ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
+                                      variable=self.clahe_var)
+        self.clahe_cb.pack(anchor="w", padx=15, pady=(8, 4))
 
         self.cudagraph_var = ctk.BooleanVar(value=self.settings.get("cuda_graph", True))
-        ctk.CTkSwitch(self.right_col, text="CUDA Graph (10% faster)",
-                      variable=self.cudagraph_var).pack(anchor="w", padx=15, pady=4)
+        self.cudagraph_cb = ctk.CTkSwitch(self.right_col, text="Use CUDA Graphs",
+                                          variable=self.cudagraph_var)
+        self.cudagraph_cb.pack(anchor="w", padx=15, pady=4)
 
         # Expressions
         ctk.CTkLabel(self.right_col, text="Expression Overrides",
@@ -689,6 +696,20 @@ class VTuberStudioApp(ctk.CTk):
             cmd += ["--bg_image", self.bg_var.get().strip()]
         return cmd
 
+    def _set_ui_state(self, state):
+        self.camera_entry.configure(state=state)
+        self.lora_entry.configure(state=state)
+        self.preview_cb.configure(state=state)
+        self.mirror_cb.configure(state=state)
+        self.vcam_cb.configure(state=state)
+        self.audio_cb.configure(state=state)
+        self.bg_keep_cb.configure(state=state)
+        self.bg_entry.configure(state=state)
+        self.bg_btn.configure(state=state)
+        self.bg_clear_btn.configure(state=state)
+        self.clahe_cb.configure(state=state)
+        self.cudagraph_cb.configure(state=state)
+
     def start_script(self):
         if self.process is not None and self.process.poll() is None:
             return
@@ -767,6 +788,7 @@ class VTuberStudioApp(ctk.CTk):
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self._set_ui_state("disabled")
         threading.Thread(target=self.read_output, args=(self.process.stdout,), daemon=True).start()
         threading.Thread(target=self.monitor_process, args=(self.process,), daemon=True).start()
 
@@ -791,6 +813,7 @@ class VTuberStudioApp(ctk.CTk):
             return
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self._set_ui_state("normal")
         self.video_label.configure(image="", text="Engine stopped.")
         self.current_frame_image = None
         self.process = None
