@@ -110,6 +110,8 @@ class VTuberStudioApp(ctk.CTk):
             "normalize_lighting": self.clahe_var.get(),
             "cuda_graph": self.cudagraph_var.get(),
             "lora": self.lora_var.get(),
+            "perf_mode": self.perf_var.get(),
+            "easynegative": self.easyneg_var.get(),
             "bg_image": self.bg_var.get(),
             "guidance": self.guidance_var.get(),
             "ai_strength": self.strength_var.get(),
@@ -231,6 +233,18 @@ class VTuberStudioApp(ctk.CTk):
                                                values=loras, width=140, command=on_lora_changed)
         self.lora_dropdown.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
+        ctk.CTkLabel(self.settings_frame, text="Performance Mode:", anchor="w").grid(
+            row=2, column=0, padx=5, pady=5, sticky="w")
+        perf_modes = [
+            "Ultra Low Latency (2-Step, 1-Frame Batch)",
+            "High FPS (2-Step, 2-Frame Batch)",
+            "High Quality (4-Step, 1-Frame Batch)"
+        ]
+        saved_perf = self.settings.get("perf_mode", "Ultra Low Latency (2-Step, 1-Frame Batch)")
+        self.perf_var = ctk.StringVar(value=saved_perf if saved_perf in perf_modes else perf_modes[0])
+        self.perf_dropdown = ctk.CTkOptionMenu(self.settings_frame, variable=self.perf_var, values=perf_modes, width=140)
+        self.perf_dropdown.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
         # Toggles
         self.preview_var = ctk.BooleanVar(value=self.settings.get("embedded_preview", True))
         self.preview_cb = ctk.CTkSwitch(self.right_col, text="Embedded Video Preview",
@@ -251,6 +265,11 @@ class VTuberStudioApp(ctk.CTk):
         self.audio_cb = ctk.CTkSwitch(self.right_col, text="Audio Lip-Sync (FFT)",
                                       variable=self.audio_var)
         self.audio_cb.pack(anchor="w", padx=15, pady=4)
+
+        self.easyneg_var = ctk.BooleanVar(value=self.settings.get("easynegative", True))
+        self.easyneg_cb = ctk.CTkSwitch(self.right_col, text="Use EasyNegative Embeds",
+                                        command=self.apply_prompt, variable=self.easyneg_var)
+        self.easyneg_cb.pack(anchor="w", padx=15, pady=4)
 
         self.bg_keep_var = ctk.BooleanVar(value=self.settings.get("keep_background", False))
         self.bg_keep_cb = ctk.CTkSwitch(self.right_col, text="Keep Real Background",
@@ -527,6 +546,8 @@ class VTuberStudioApp(ctk.CTk):
         """Push whatever is in the two text boxes to the running engine."""
         prompt = self.prompt_entry.get().strip()
         negative = self.neg_prompt_entry.get().strip()
+        if getattr(self, "easyneg_var", None) and self.easyneg_var.get():
+            negative = negative + ", EasyNegative" if negative else "EasyNegative"
         if not prompt:
             self.log("[Prompt] Nothing to apply — the prompt box is empty.")
             return
@@ -699,13 +720,28 @@ class VTuberStudioApp(ctk.CTk):
         lora_val = self.lora_var.get()
         if lora_val == "None (Original Default)":
             lora_val = "None"
+        
+        neg_val = self.neg_prompt_entry.get().strip()
+        if getattr(self, "easyneg_var", None) and self.easyneg_var.get():
+            neg_val = neg_val + ", EasyNegative" if neg_val else "EasyNegative"
+            
+        perf = self.perf_var.get()
+        if perf == "High FPS (2-Step, 2-Frame Batch)":
+            fb, steps = 2, 2
+        elif perf == "High Quality (4-Step, 1-Frame Batch)":
+            fb, steps = 1, 4
+        else:
+            fb, steps = 1, 2
+            
         cmd = [
             self.python_executable(), "-u",
             os.path.join(SCRIPT_DIR, "realtime_video.py"),
             "--prompt", self.prompt_entry.get(),
-            "--negative_prompt", self.neg_prompt_entry.get(),
+            "--negative_prompt", neg_val,
             "--camera", self.camera_entry.get().strip() or "0",
             "--lora", lora_val,
+            "--frame_buffer", str(fb),
+            "--steps", str(steps),
             "--guidance_scale", f"{max(1.05, self.guidance_var.get()):.3f}",
             "--t_index", str(strength_to_t_index(self.strength_var.get())),
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",

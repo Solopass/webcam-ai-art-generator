@@ -34,11 +34,26 @@ for lora in lora_files:
     print(f"This will take 5-15 minutes. DO NOT CLOSE.")
     print(f"======================================")
     
+    import json
+    fb, steps = 1, 2
+    try:
+        with open("vtuber_settings.json", "r") as f:
+            settings = json.load(f)
+            perf = settings.get("perf_mode", "")
+            if perf == "High FPS (2-Step, 2-Frame Batch)":
+                fb, steps = 2, 2
+            elif perf == "High Quality (4-Step, 1-Frame Batch)":
+                fb, steps = 1, 4
+    except:
+        pass
+
     cmd = [
         os.path.join(SCRIPT_DIR, "venv", "Scripts", "python.exe"), "-u", "realtime_video.py",
         "--mock_camera",
         "--lora", lora,
-        "--cmd_port", "12345"
+        "--cmd_port", "12345",
+        "--frame_buffer", str(fb),
+        "--steps", str(steps)
     ]
     
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)

@@ -597,6 +597,8 @@ def build_args():
     parser.add_argument("--t_index", type=int, default=32,
                         help="Denoise start step out of 50. Lower = more AI "
                              "stylisation, higher = closer to the raw webcam.")
+    parser.add_argument("--frame_buffer", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--cfg_type", type=str, default="full",
                         choices=["none", "self", "initialize", "full"])
     parser.add_argument("--mirror_camera", action="store_true")
@@ -623,7 +625,7 @@ def build_args():
     if unknown:
         log(f"[Engine] Ignoring unknown arguments: {' '.join(unknown)}")
 
-    args.frame_buffer = 1  # must be 1 for the 1-step LCM TensorRT engine
+    
     # NOTE: --no_color_lock and the Reinhard color_transfer() it controlled were
     # removed. The 2-step/full-CFG output does not strobe the way the 1-step
     # output did, so the stabiliser was taken out of postprocess_thread — and a
@@ -724,7 +726,16 @@ def load_model_and_engine(args, lora_name):
         "madebyollin/taesd", torch_dtype=torch.float16
     ).to("cuda")
 
-    engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_fb{args.frame_buffer}")
+    embeddings_dir = os.path.join(SCRIPT_DIR, "embeddings")
+    if os.path.isdir(embeddings_dir):
+        for emb in os.listdir(embeddings_dir):
+            if emb.endswith(".safetensors") or emb.endswith(".pt"):
+                emb_path = os.path.join(embeddings_dir, emb)
+                token = os.path.splitext(emb)[0]
+                log(f"[Engine] Loading Textual Inversion: {token}")
+                pipe.load_textual_inversion(emb_path, token=token)
+
+    engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_fb{args.frame_buffer}_steps{args.steps}")
     if lora_name and lora_name.lower() != "none":
         lora_path = os.path.join(SCRIPT_DIR, "loras", lora_name)
         if os.path.exists(lora_path):
@@ -733,13 +744,16 @@ def load_model_and_engine(args, lora_name):
             pipe.fuse_lora()
             safe = "".join(c for c in lora_name if c.isalnum() or c in ("-", "_"))
             safe = safe.replace("safetensors", "")
-            engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_{safe}_fb{args.frame_buffer}")
+            engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_{safe}_fb{args.frame_buffer}_steps{args.steps}")
         else:
             log(f"[Engine] LoRA not found at {lora_path} — continuing without it.")
 
-    step1 = min(args.t_index - 2, max(10, args.t_index - 15))
-    step1 = max(0, step1)
-    t_list = [step1, args.t_index]
+    if args.steps == 4:
+        t_list = [max(0, args.t_index - 30), max(0, args.t_index - 20), max(0, args.t_index - 10), args.t_index]
+    else:
+        step1 = min(args.t_index - 2, max(10, args.t_index - 15))
+        step1 = max(0, step1)
+        t_list = [step1, args.t_index]
     
     stream = StreamDiffusion(
         pipe,
@@ -788,55 +802,7 @@ def main():
         log("[FATAL] No CUDA device found. This engine needs an NVIDIA GPU.")
         sys.exit(1)
 
-    log("[Engine] Loading base model (kohaku-v2.1)...")
-    pipe = StableDiffusionPipeline.from_pretrained(
-        "KBlueLeaf/kohaku-v2.1",
-        torch_dtype=torch.float16,
-        safety_checker=None,
-    ).to("cuda")
-
-    log("[Engine] Swapping in TinyVAE...")
-    pipe.vae = AutoencoderTiny.from_pretrained(
-        "madebyollin/taesd", torch_dtype=torch.float16
-    ).to("cuda")
-
-    engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_fb{args.frame_buffer}")
-    if args.lora and args.lora.lower() != "none":
-        lora_path = os.path.join(SCRIPT_DIR, "loras", args.lora)
-        if os.path.exists(lora_path):
-            log(f"[Engine] Fusing character LoRA: {args.lora}")
-            pipe.load_lora_weights(lora_path)
-            pipe.fuse_lora()
-            safe = "".join(c for c in args.lora if c.isalnum() or c in ("-", "_"))
-            safe = safe.replace("safetensors", "")
-            engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_{safe}_fb{args.frame_buffer}")
-        else:
-            log(f"[Engine] LoRA not found at {lora_path} — continuing without it.")
-
-    # Use 2-step generation for vastly superior quality compared to 1-step,
-    # and standard CFG ("full") to actually enforce the prompt.
-    # The extra clamp keeps the list strictly ascending: at a low t_index the
-    # old formula produced e.g. [10, 5], which reverses the noise schedule.
-    # Inside the GUI's slider range (t_index 12-45) this is a no-op.
-    step1 = min(args.t_index - 2, max(10, args.t_index - 15))
-    step1 = max(0, step1)
-    t_list = [step1, args.t_index]
-    
-    stream = StreamDiffusion(
-        pipe,
-        t_index_list=t_list,
-        torch_dtype=torch.float16,
-        cfg_type="full",
-        do_add_noise=True,
-        use_denoising_batch=True,
-        frame_buffer_size=args.frame_buffer,
-    )
-
-    log("[Engine] Loading LCM-LoRA...")
-    stream.load_lcm_lora()
-    # Without fusing, the LCM weights are not baked into the ONNX export and a
-    # freshly built TensorRT engine produces noise at 1 step.
-    stream.fuse_lora()
+    pipe, stream = load_model_and_engine(args, args.lora)
 
     import json
     try:
@@ -868,19 +834,6 @@ def main():
         num_inference_steps=50,
         guidance_scale=args.guidance_scale,
         delta=args.delta,
-    )
-
-
-
-    log(f"[Engine] Applying TensorRT acceleration ({os.path.basename(engine_dir)}).")
-    if not os.path.exists(os.path.join(engine_dir, "unet.engine")):
-        log("[Engine] No cached engine found — the first build takes 5-15 minutes. Please wait.")
-    stream = accelerate_with_tensorrt(
-        stream,
-        engine_dir,
-        max_batch_size=stream.trt_unet_batch_size,
-        use_cuda_graph=args.cuda_graph,
-        engine_build_options={"opt_batch_size": stream.trt_unet_batch_size},
     )
 
     # 1.0 means "never skip"; anything lower freezes the output while you sit
