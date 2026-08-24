@@ -6,8 +6,7 @@ A real-time AI VTuber engine powered by **StreamDiffusion**, **TensorRT**, and *
 
 ## Features
 
-- **Instant LoRA Hot-Swapping:** Change your character on the fly! The engine instantly flushes VRAM and loads pre-compiled TensorRT `.engine` caches in under 2 seconds without stopping the video feed.
-- **Overnight Batch Pre-Compiler:** Drop new `.safetensors` into `loras/` and run `python precompile_loras.py` to batch-compile all your characters overnight so they are instantly ready for your stream.
+- **Zero-Compile LoRA Hot-Swapping:** Change your character on the fly! The engine uses experimental **TensorRT VRAM Refitting**. You only ever wait 10 minutes to compile the "Universal Base Model" once. From then on, any new character LoRA you download can be hot-swapped into the running GPU memory instantly without ever needing to compile it.
 - **WebP Replay Exports:** Hit `Ctrl+S` (or use the UI button) to instantly save the last 5 seconds of your stream as an animated `.webp` for easy sharing.
 - **Live UI Tuning:** Tune your prompt, CFG, Motion Blur, and trigger sensitivities live via a ZeroMQ event channel without restarting the TensorRT engine.** Tune your prompt, CFG, Motion Blur, and trigger sensitivities live via a ZeroMQ event channel without restarting the TensorRT engine.
 - **MediaPipe Face Tracking:** Dynamically tracks your face, panning and cropping the camera automatically. Maps your real-world facial expressions (smile, closed eyes) directly into the AI prompt!
@@ -63,7 +62,7 @@ For the text prompt, the engine re-encodes the CLIP embeddings in-place and copi
 
 ## Engine Cache
 
-TensorRT engines are cached per LoRA in ngines_tinyvae_<lora>_fb1/. The first build for a new LoRA takes 5–15 minutes; the log will say so when no cached engine is found. rame_buffer is pinned to 1 — any other value makes TensorRT expect a different batch and fail with a shape error.
+TensorRT engines are cached centrally in `engines_tinyvae_base_...`. The first build takes 10–15 minutes while TensorRT generates a massive benchmark file (`trt_global_timing.cache`). Once this is built, you NEVER have to wait for an engine again. Character LoRAs are injected dynamically at runtime via TensorRT Refitting.
 
 ## Troubleshooting
 

@@ -147,6 +147,83 @@ class VTuberStudioApp(ctk.CTk):
         self.right_col = ctk.CTkScrollableFrame(self.main_frame, width=290)
         self.right_col.pack(side=ctk.RIGHT, fill=ctk.Y)
 
+        # --- LEFT: prompting + preview ---
+        prompt_builder_frame = ctk.CTkFrame(self.left_col, fg_color="transparent")
+        prompt_builder_frame.pack(fill=ctk.X, padx=10, pady=(10, 0))
+        
+        self.prompt_dropdowns = []
+        
+        def load_prompts_from_md():
+            prompts = {}
+            current_category = "Uncategorized"
+            md_path = os.path.join(SCRIPT_DIR, "prompts.md")
+            if not os.path.exists(md_path):
+                return {"Uncategorized": []}
+            with open(md_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    if line.startswith("# "):
+                        current_category = line[2:].strip()
+                        if current_category not in prompts:
+                            prompts[current_category] = []
+                    elif line.startswith("- "):
+                        prompts[current_category].append(line[2:].strip())
+                    else:
+                        prompts[current_category].append(line)
+            return prompts
+
+        def build_dropdowns():
+            for widget in prompt_builder_frame.winfo_children():
+                widget.destroy()
+            self.prompt_dropdowns.clear()
+            
+            categories = load_prompts_from_md()
+            row = ctk.CTkFrame(prompt_builder_frame, fg_color="transparent")
+            row.pack(fill=ctk.X)
+            
+            for cat, items in categories.items():
+                if not items or cat == "Uncategorized": continue
+                val_list = [f"-- {cat} --"] + items
+                dd = ctk.CTkOptionMenu(row, values=val_list, width=110, text_color=("black", "white"))
+                dd.set(f"-- {cat} --")
+                dd.pack(side=ctk.LEFT, padx=2, pady=2)
+                self.prompt_dropdowns.append((cat, dd))
+                
+            def combine_prompts():
+                parts = []
+                for cat, dd in self.prompt_dropdowns:
+                    v = dd.get()
+                    if not v.startswith("-- "):
+                        parts.append(v)
+                if parts:
+                    self.prompt_entry.delete(0, 'end')
+                    self.prompt_entry.insert(0, ", ".join(parts))
+                    self.apply_prompt()
+            
+            ctk.CTkButton(row, text="Generate", width=70, command=combine_prompts).pack(side=ctk.LEFT, padx=5)
+            ctk.CTkButton(row, text="?", width=30, command=build_dropdowns).pack(side=ctk.LEFT)
+
+        build_dropdowns()
+
+        prompt_row = ctk.CTkFrame(self.left_col, fg_color="transparent")
+        prompt_row.pack(fill=ctk.X, padx=10, pady=5)
+        
+        self.prompt_entry = ctk.CTkEntry(prompt_row, placeholder_text="Master Prompt...")
+        self.prompt_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True)
+        
+        def save_to_md():
+            current = self.prompt_entry.get().strip()
+            if not current: return
+            md_path = os.path.join(SCRIPT_DIR, "prompts.md")
+            with open(md_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n{current}\n")
+            build_dropdowns()
+            
+        ctk.CTkButton(prompt_row, text="💾 Save", width=60, command=save_to_md, hover_color="#333333").pack(side=ctk.LEFT, padx=5)
+        self.apply_btn = ctk.CTkButton(prompt_row, text="Apply ⏎", width=86, command=self.apply_prompt)
+        self.apply_btn.pack(side=ctk.LEFT, padx=(6, 0))
+
         def build_prompt_header(label_text, entry_box, settings_key):
             header = ctk.CTkFrame(self.left_col, fg_color="transparent")
             header.pack(fill=ctk.X, padx=10, pady=(10, 0))
@@ -173,17 +250,6 @@ class VTuberStudioApp(ctk.CTk):
             dropdown.pack(side=ctk.LEFT)
             ctk.CTkButton(header, text="💾", width=30, height=24, fg_color="transparent",
                           command=on_save, hover_color="#333333").pack(side=ctk.LEFT, padx=5)
-
-        # --- LEFT: prompting + preview ---
-        prompt_row = ctk.CTkFrame(self.left_col, fg_color="transparent")
-        
-        self.prompt_entry = ctk.CTkEntry(prompt_row, placeholder_text="Describe your VTuber...")
-        build_prompt_header("Master Prompt ▾", self.prompt_entry, "saved_prompts")
-        prompt_row.pack(fill=ctk.X, padx=10, pady=5)
-        self.prompt_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True)
-        self.apply_btn = ctk.CTkButton(prompt_row, text="Apply ⏎", width=86,
-                                       command=self.apply_prompt)
-        self.apply_btn.pack(side=ctk.LEFT, padx=(6, 0))
 
         self.neg_prompt_entry = ctk.CTkEntry(self.left_col)
         build_prompt_header("Negative Prompt ▾", self.neg_prompt_entry, "saved_neg_prompts")
@@ -272,8 +338,8 @@ class VTuberStudioApp(ctk.CTk):
         self.easyneg_cb.pack(anchor="w", padx=15, pady=4)
 
         self.bg_keep_var = ctk.BooleanVar(value=self.settings.get("keep_background", False))
-        self.bg_keep_cb = ctk.CTkSwitch(self.right_col, text="Keep Real Background",
-                                        variable=self.bg_keep_var)
+        self.bg_keep_cb = ctk.CTkSwitch(self.right_col, text="Composite Real Background",
+                                        command=lambda: self.cmd_socket.send_string(__import__("json").dumps({"composite": self.bg_keep_var.get()})) if getattr(self, "cmd_socket", None) else None, variable=self.bg_keep_var)
         self.bg_keep_cb.pack(anchor="w", padx=15, pady=4)
 
         # Background image
@@ -307,6 +373,7 @@ class VTuberStudioApp(ctk.CTk):
         # tensor and changes the UNet batch out from under the built engine.
         self.guidance_var = ctk.DoubleVar(value=max(1.05, self.settings.get("guidance", 1.4)))
         self._slider_row(1, "Prompt Strictness (CFG)", self.guidance_var, 1.05, 3.0, 20, fmt=lambda v: f"{v:.2f}",
+                         on_change=lambda v: self.cmd_socket.send_string(__import__("json").dumps({"guidance_scale": float(v)})) if getattr(self, "cmd_socket", None) else None,
                          desc="How strictly the AI follows your text prompt. High values may look deep-fried.")
 
         import json
@@ -660,12 +727,17 @@ class VTuberStudioApp(ctk.CTk):
                 out_dir = os.path.join(SCRIPT_DIR, "snapshots")
                 os.makedirs(out_dir, exist_ok=True)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = os.path.join(out_dir, f"replay_{ts}.webp")
-
-                rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
-                imageio.mimsave(filename, rgb_frames, format='WEBP', fps=30, loop=0, lossless=False)
+                filename = os.path.join(out_dir, f"replay_{ts}.mp4")
                 
-                self.after(0, self.log, f"[Replay] Saved WebP replay to {filename}")
+                h, w = frames[0].shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(filename, fourcc, 30.0, (w, h))
+                
+                for f in frames:
+                    writer.write(f)
+                writer.release()
+                
+                self.after(0, self.log, f"[Replay] Saved MP4 replay to {filename}")
             except Exception as e:
                 self.after(0, self.log, f"[Replay] Error saving replay: {e}")
             finally:

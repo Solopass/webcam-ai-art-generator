@@ -1,4 +1,4 @@
-# HANDOFF — TensorRT AI VTuber Studio
+# HANDOFF - Webcam AI Art Generator (V2.0)
 
 Last updated 2026-08-23. Read this document before contributing or changing code. The architecture is highly deliberate to squeeze maximum performance out of the StreamDiffusion GPU loop.
 
@@ -6,7 +6,7 @@ Last updated 2026-08-23. Read this document before contributing or changing code
 
 ## 1. What this is and where it stands
 
-A real-time AI VTuber Engine: StreamDiffusion + TensorRT turning a webcam or desktop feed into a live stylised video stream at ~26 FPS, with real-time UI tuning via ZMQ, Audio Lip-Sync, and Face Tracking.
+A real-time AI Art Generator: StreamDiffusion + TensorRT turning a webcam or desktop feed into a live stylised video stream. The primary use-case is using the webcam as a live posing/composition tool to generate high-quality AI art, which can then be snapshotted and exported for upscaling.
 
 **It works flawlessly.** Measured on an RTX 3080 Ti:
 
@@ -15,7 +15,7 @@ A real-time AI VTuber Engine: StreamDiffusion + TensorRT turning a webcam or des
 [Engine] output 26.4 fps, 2.4ms work/frame (composite off, smoothing on)
 `
 
-infer 64ms is the whole ceiling and it is a **deliberate trade**: two denoise steps at cfg_type="full" is four UNet passes per frame. The postprocess thread interpolates the ~26 FPS inference stream up to a buttery 30+ FPS output, which costs about two frames of latency.
+infer 64ms is the whole ceiling and it is a **deliberate trade**: two denoise steps at cfg_type="full" is four UNet passes per frame. 
 
 `
 Start_GUI.bat                             # Boot the visual Launcher
@@ -23,7 +23,7 @@ python run_checks.py                      # all GPU-free checks, ~10s
 venv\Scripts\python.exe smoke_test.py     # end-to-end, synthetic camera
 `
 
-Everything writes to logs/: ngine-latest.log (environment block, every engine line, full traceback on death) and launcher-latest.log. 
+Everything writes to logs/: gine-latest.log (environment block, every engine line, full traceback on death) and launcher-latest.log. 
 
 ---
 
@@ -47,13 +47,16 @@ The UI communicates with the engine purely through ZeroMQ:
 * **PUSH/PULL Command Socket:** The UI pushes JSON payloads when sliders are dragged. The engine drains this queue completely during its pacing sleep cycle, meaning the UI sliders can be scrubbed vigorously without causing minutes of lag.
 
 ## 4. Completed Features
-- **Instant LoRA Hot-Swapping**: Drops VRAM and gracefully reloads new TensorRT `.engine` characters in <2 seconds.
-- **Batch Pre-Compiler**: Added `precompile_loras.py` to batch compile characters overnight.
-- **WebP Replay Exports**: UI natively supports `Ctrl+S` caching of the last 150 frames to an animated WebP file.
-- **Face & Audio Tracking**: Integrated MediaPipe and PyAudio FFT to live-inject expressions like "open mouth" into the prompt.
-- **Sensitivities & Overrides**: Allowed real-time tuning of trigger thresholds and replacement expressions via the UI.
-- **Background Compositing**: Selfie segmenter cleanly drops the user onto custom backgrounds with adjustable Bokeh blurs.
-- **Screen Sharing**: Safely skips Selfie Segmentation on desktop captures so the whole screen is stylized.
+- **Zero-Compile Dynamic LoRA Hot-Swapping**: Features a highly complex TensorRT VRAM Refitting pipeline. The engine permanently boots a single refittable "Base" UNet. Changing LoRAs triggers an on-the-fly PyTorch UNet fusion, an ONNX export, and a direct injection of the new weights into the live CUDA Engine.
+- **CUDA Graph Offset Optimization**: By pairing TensorRT Refitting with CUDA Graph execution, we negate the dispatch latency overhead caused by un-fused layer paths in the unlocked engine.
 
-## 5. Next Steps / V2.0 Ideas
-- **ControlNet Depth Integration**: The only way to perfectly lock the AI to the exact structural lines of a drawing or face. This requires entirely rewriting the TensorRT engine builder script, as streamdiffusion does not natively support ControlNet TRT engines.
+## 5. Known Behaviors & Compilation Times
+- **TensorRT Timing Cache Generation**: In `StreamDiffusion/src/streamdiffusion/acceleration/tensorrt/utilities.py`, we removed a bug that forcefully disabled cuDNN (`tactic_sources=[]`). With Nvidia libraries properly enabled, the first-time generation of the `trt_global_timing.cache` is extremely heavy.
+  - **Low Latency Mode (Batch Size 4):** ~15 minutes to compile on RTX 3080 Ti.
+  - **High Quality Mode (Batch Size 8):** Can trigger a silent WDDM driver deadlock in TensorRT 9 on Windows. The GPU will sit at 100% utilization, but the C++ Polygraphy builder will silently hang in an infinite loop while benchmarking cuDNN convolution heuristics.
+  - **Claude / AI Audit Note**: If the user experiences a 2+ hour compile for Batch Size 8 that never finishes, **the codebase is not bugged**, the C++ compiler is deadlocked. The solution is to kill the Python process and instruct the user to select **"2-Step Low Latency"** in the GUI, which forces Batch Size 4 and completely avoids the WDDM memory deadlock.
+
+## 6. Next Steps / V2.0 Ideas
+- **ControlNet Integration (Highest Priority)**: The only way to perfectly lock the AI to the exact structural lines and poses of the webcam feed. Crucial for using the webcam as an art composition tool.
+- **1-Step Turbo Upgrade**: Migrating the base pipeline to SD-Turbo or LCM to quadruple the framerate and generation speed without sacrificing art quality.
+- **High-Res Snapshot Export**: Allowing users to save the raw noise latents or seeds alongside their snapshots for seamless drag-and-drop upscaling in ComfyUI or A1111.

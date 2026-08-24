@@ -11,3 +11,8 @@ engines_tinyvae_fb*/
 test_output.png
 *.mp4
 *.avi
+*.webm
+snapshots/
+StreamDiffusion/
+trt_global_timing.cache
+trt_global_timing.cache.lock

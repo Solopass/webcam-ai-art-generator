@@ -703,7 +703,7 @@ def cmd_listener_thread(port, state_dict):
     finally:
         try:
             socket.close(linger=0)
-            context.term()
+            context.destroy(linger=0)
         except Exception:
             pass
 
@@ -735,18 +735,7 @@ def load_model_and_engine(args, lora_name):
                 log(f"[Engine] Loading Textual Inversion: {token}")
                 pipe.load_textual_inversion(emb_path, token=token)
 
-    engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_fb{args.frame_buffer}_steps{args.steps}")
-    if lora_name and lora_name.lower() != "none":
-        lora_path = os.path.join(SCRIPT_DIR, "loras", lora_name)
-        if os.path.exists(lora_path):
-            log(f"[Engine] Fusing character LoRA: {lora_name}")
-            pipe.load_lora_weights(lora_path)
-            pipe.fuse_lora()
-            safe = "".join(c for c in lora_name if c.isalnum() or c in ("-", "_"))
-            safe = safe.replace("safetensors", "")
-            engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_{safe}_fb{args.frame_buffer}_steps{args.steps}")
-        else:
-            log(f"[Engine] LoRA not found at {lora_path} — continuing without it.")
+    engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_base_fb{args.frame_buffer}_steps{args.steps}")
 
     if args.steps == 4:
         t_list = [max(0, args.t_index - 30), max(0, args.t_index - 20), max(0, args.t_index - 10), args.t_index]
@@ -777,9 +766,69 @@ def load_model_and_engine(args, lora_name):
         engine_dir,
         max_batch_size=stream.trt_unet_batch_size,
         use_cuda_graph=args.cuda_graph,
-        engine_build_options={"opt_batch_size": stream.trt_unet_batch_size},
+        engine_build_options={
+            "opt_batch_size": stream.trt_unet_batch_size,
+            "build_enable_refit": True,
+            "timing_cache": os.path.join(SCRIPT_DIR, "trt_global_timing.cache")
+        },
     )
     return pipe, stream
+
+def refit_lora_to_trt(stream, args, lora_name):
+    import gc
+    from diffusers import StableDiffusionPipeline
+    from streamdiffusion.acceleration.tensorrt.models import UNet
+    from streamdiffusion.acceleration.tensorrt.utilities import export_onnx, optimize_onnx
+    
+    log(f"[Engine] Starting dynamic TRT Refit for LoRA: {lora_name}")
+    engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_base_fb{args.frame_buffer}_steps{args.steps}")
+    
+    log("[Engine] Reloading PyTorch UNet into RAM...")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        "KBlueLeaf/kohaku-v2.1",
+        torch_dtype=torch.float16,
+        safety_checker=None,
+    ).to("cuda")
+    
+    if lora_name and lora_name.lower() != "none":
+        lora_path = os.path.join(SCRIPT_DIR, "loras", lora_name)
+        if os.path.exists(lora_path):
+            log(f"[Engine] Fusing {lora_name} into UNet...")
+            pipe.load_lora_weights(lora_path)
+            pipe.fuse_lora()
+    
+    log("[Engine] Fusing LCM-LoRA...")
+    pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
+    pipe.fuse_lora()
+    
+    log("[Engine] Exporting temporary refit ONNX...")
+    unet_model = UNet(
+        fp16=True,
+        device=pipe.device,
+        max_batch_size=stream.trt_unet_batch_size,
+        min_batch_size=1,
+        embedding_dim=pipe.text_encoder.config.hidden_size,
+        unet_dim=pipe.unet.config.in_channels,
+    )
+    
+    base_onnx = os.path.join(engine_dir, "onnx", "unet.opt.onnx")
+    refit_onnx = os.path.join(engine_dir, "onnx", "unet_refit.onnx")
+    refit_opt_onnx = os.path.join(engine_dir, "onnx", "unet_refit.opt.onnx")
+    
+    export_onnx(pipe.unet, refit_onnx, unet_model, 512, 512, stream.trt_unet_batch_size, 17)
+    
+    log("[Engine] Optimizing refit ONNX...")
+    optimize_onnx(refit_onnx, refit_opt_onnx, unet_model)
+    
+    log("[Engine] Refitting TensorRT Engine in VRAM... (Expect a 1-second freeze)")
+    stream.unet.engine.refit(base_onnx, refit_opt_onnx)
+    stream.unet.engine.cuda_graph_instance = None
+    
+    log("[Engine] Dynamic Refit Complete! Resuming stream.")
+    
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def main():
     args = build_args()
@@ -803,6 +852,9 @@ def main():
         sys.exit(1)
 
     pipe, stream = load_model_and_engine(args, args.lora)
+    
+    if args.lora and args.lora.lower() != "none":
+        refit_lora_to_trt(stream, args, args.lora)
 
     import json
     try:
@@ -899,6 +951,26 @@ def main():
                     stream.similar_filter.set_threshold(val)
                 elif val < 0.999:
                     stream.enable_similar_image_filter(threshold=val, max_skip_frame=10)
+            
+            if "guidance_scale" in state_dict:
+                val = state_dict.pop("guidance_scale")
+                stream.guidance_scale = val
+                # When turning off CFG, we MUST empty the prompt tensor so StreamDiffusion disables CFG!
+                if stream.guidance_scale <= 1.0 and stream.prompt_embeds.shape[0] > stream.batch_size:
+                    stream.prompt_embeds = stream.prompt_embeds[stream.batch_size:]
+                # When turning ON CFG, we must re-prepare!
+                elif stream.guidance_scale > 1.0 and stream.prompt_embeds.shape[0] == stream.batch_size:
+                    state_dict["prompt_dirty"] = True
+            
+            if "guidance_scale" in state_dict:
+                val = state_dict.pop("guidance_scale")
+                stream.guidance_scale = val
+                # When turning off CFG, we MUST empty the prompt tensor so StreamDiffusion disables CFG!
+                if stream.guidance_scale <= 1.0 and stream.prompt_embeds.shape[0] > stream.batch_size:
+                    stream.prompt_embeds = stream.prompt_embeds[stream.batch_size:]
+                # When turning ON CFG, we must re-prepare!
+                elif stream.guidance_scale > 1.0 and stream.prompt_embeds.shape[0] == stream.batch_size:
+                    state_dict["prompt_dirty"] = True
 
             t_wait = time.perf_counter()
             try:
@@ -980,7 +1052,12 @@ def main():
                 # was stalling the loop several times a second.
 
             t_got = time.perf_counter()
-            output_image = stream(Image.fromarray(frame_rgb))
+            # Duplicate the single webcam frame to fill the required TensorRT batch size
+            input_imgs = [Image.fromarray(frame_rgb)] * args.frame_buffer
+            if args.frame_buffer == 1:
+                input_imgs = input_imgs[0]
+                
+            output_image = stream(input_imgs)
             
             t_done = time.perf_counter()
 
@@ -989,15 +1066,7 @@ def main():
                 log(f"[Engine] LoRA hot-swap requested: {current_lora} -> {new_lora}")
                 current_lora = new_lora
                 
-                # Cleanup old engine
-                import gc
-                del stream
-                del pipe
-                gc.collect()
-                torch.cuda.empty_cache()
-                
-                # Rebuild
-                pipe, stream = load_model_and_engine(args, current_lora)
+                refit_lora_to_trt(stream, args, current_lora)
                 state_dict["prompt_dirty"] = True
                 
                 # Re-warmup
