@@ -1,5 +1,5 @@
 {
-    "prompt": "northern lights, space",
+    "prompt": "stained glass window portrait, colorful, divine light",
     "negative_prompt": "blurry",
     "camera": "screen 2 (Secondary)",
     "embedded_preview": true,
@@ -15,14 +15,14 @@
     "bg_image": "",
     "guidance": 1.05,
     "ai_strength": 85.0,
-    "freeze": 0.97,
+    "freeze": 1.0,
     "motion_smoothing": 0.65,
     "bokeh_blur": 0.0,
     "expr_smiling": "smiling",
     "expr_open mouth": "open mouth",
     "expr_closed eyes": "closed eyes",
-    "sens_smile": 0.00912,
+    "sens_smile": 0.001,
     "sens_mouth": 0.03322857142857143,
-    "sens_eyes": 0.016571428571428574,
+    "sens_eyes": 0.018821428571428572,
     "sens_audio": 4.5125714285714285
 }

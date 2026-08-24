@@ -110,6 +110,7 @@ class VTuberStudioApp(ctk.CTk):
             "normalize_lighting": self.clahe_var.get(),
             "cuda_graph": self.cudagraph_var.get(),
             "lora": self.lora_var.get(),
+            "controlnet": self.controlnet_var.get(),
             "perf_mode": self.perf_var.get(),
             "easynegative": self.easyneg_var.get(),
             "bg_image": self.bg_var.get(),
@@ -299,8 +300,17 @@ class VTuberStudioApp(ctk.CTk):
                                                values=loras, width=140, command=on_lora_changed)
         self.lora_dropdown.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
-        ctk.CTkLabel(self.settings_frame, text="Performance Mode:", anchor="w").grid(
+        ctk.CTkLabel(self.settings_frame, text="ControlNet Mode:", anchor="w").grid(
             row=2, column=0, padx=5, pady=5, sticky="w")
+        saved_cnet = self.settings.get("controlnet", "None")
+        self.controlnet_var = ctk.StringVar(value=saved_cnet)
+        self.controlnet_dropdown = ctk.CTkOptionMenu(
+            self.settings_frame, variable=self.controlnet_var,
+            values=["None", "Depth (MiDaS)"], width=140)
+        self.controlnet_dropdown.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        ctk.CTkLabel(self.settings_frame, text="Performance Mode:", anchor="w").grid(
+            row=3, column=0, padx=5, pady=5, sticky="w")
         perf_modes = [
             "Ultra Low Latency (2-Step, 1-Frame Batch)",
             "High FPS (2-Step, 2-Frame Batch)",
@@ -309,7 +319,7 @@ class VTuberStudioApp(ctk.CTk):
         saved_perf = self.settings.get("perf_mode", "Ultra Low Latency (2-Step, 1-Frame Batch)")
         self.perf_var = ctk.StringVar(value=saved_perf if saved_perf in perf_modes else perf_modes[0])
         self.perf_dropdown = ctk.CTkOptionMenu(self.settings_frame, variable=self.perf_var, values=perf_modes, width=140)
-        self.perf_dropdown.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.perf_dropdown.grid(row=3, column=1, padx=5, pady=5, sticky="w")
 
         # Toggles
         self.preview_var = ctk.BooleanVar(value=self.settings.get("embedded_preview", True))
@@ -805,6 +815,12 @@ class VTuberStudioApp(ctk.CTk):
         else:
             fb, steps = 1, 2
             
+        cnet_val = self.controlnet_var.get()
+        if cnet_val == "Depth (MiDaS)":
+            cnet_cmd = "depth"
+        else:
+            cnet_cmd = "none"
+
         cmd = [
             self.python_executable(), "-u",
             os.path.join(SCRIPT_DIR, "realtime_video.py"),
@@ -812,6 +828,7 @@ class VTuberStudioApp(ctk.CTk):
             "--negative_prompt", neg_val,
             "--camera", self.camera_entry.get().strip() or "0",
             "--lora", lora_val,
+            "--controlnet", cnet_cmd,
             "--frame_buffer", str(fb),
             "--steps", str(steps),
             "--guidance_scale", f"{max(1.05, self.guidance_var.get()):.3f}",

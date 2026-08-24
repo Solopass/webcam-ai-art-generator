@@ -620,6 +620,9 @@ def build_args():
     parser.add_argument("--cuda_graph", action="store_true",
                         help="~10%% faster but has been observed to emit stale / "
                              "corrupted frames on some driver versions.")
+    parser.add_argument("--controlnet", type=str, default="none",
+                        choices=["none", "depth"],
+                        help="Enable ControlNet preprocessor and engine.")
 
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -772,7 +775,28 @@ def load_model_and_engine(args, lora_name):
             "timing_cache": os.path.join(SCRIPT_DIR, "trt_global_timing.cache")
         },
     )
-    return pipe, stream
+
+    depth_estimator = None
+    if args.controlnet == "depth":
+        from streamdiffusion.acceleration.tensorrt.engine import UNet2DConditionModelEngine
+        from controlnet_aux import MidasDetector
+        
+        controlnet_engine_path = os.path.join(SCRIPT_DIR, "engines_controlnet", "unet_depth.engine")
+        if not os.path.exists(controlnet_engine_path):
+            log(f"[FATAL] ControlNet engine not found at {controlnet_engine_path}.")
+            sys.exit(1)
+            
+        log("[Engine] Swapping base UNet engine with fused ControlNet Depth engine...")
+        stream.unet = UNet2DConditionModelEngine(
+            controlnet_engine_path, 
+            stream.unet.stream, 
+            use_cuda_graph=args.cuda_graph
+        )
+        
+        log("[Engine] Loading MiDaS Depth Estimator...")
+        depth_estimator = MidasDetector.from_pretrained("lllyasviel/Annotators").to("cuda")
+
+    return pipe, stream, depth_estimator
 
 def refit_lora_to_trt(stream, args, lora_name):
     import gc
@@ -851,7 +875,7 @@ def main():
         log("[FATAL] No CUDA device found. This engine needs an NVIDIA GPU.")
         sys.exit(1)
 
-    pipe, stream = load_model_and_engine(args, args.lora)
+    pipe, stream, depth_estimator = load_model_and_engine(args, args.lora)
     
     if args.lora and args.lora.lower() != "none":
         refit_lora_to_trt(stream, args, args.lora)
@@ -1057,7 +1081,18 @@ def main():
             if args.frame_buffer == 1:
                 input_imgs = input_imgs[0]
                 
-            output_image = stream(input_imgs)
+            kwargs = {}
+            if depth_estimator is not None:
+                import torchvision.transforms.functional as TF
+                # Run MiDaS detector
+                depth_pil = depth_estimator(Image.fromarray(frame_rgb))
+                # Convert to Tensor [B, 3, H, W] scaled to [0, 1]
+                depth_tensor = TF.to_tensor(depth_pil).unsqueeze(0).to(dtype=torch.float16, device="cuda")
+                if args.frame_buffer > 1:
+                    depth_tensor = depth_tensor.repeat(args.frame_buffer, 1, 1, 1)
+                kwargs["controlnet_cond"] = depth_tensor
+
+            output_image = stream(input_imgs, **kwargs)
             
             t_done = time.perf_counter()
 
