@@ -474,7 +474,7 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
             except queue.Empty:
                 pass
         try:
-            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final, frame, (current_x, current_y, size)))
+            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final, frame, (current_x if not args.no_face_track else 0, current_y if not args.no_face_track else 0, cw, ch)))
         except queue.Full:
             pass
 
@@ -587,21 +587,22 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
         
         # HD VFX Compositing
         if full_frame is not None and crop_coords is not None:
-            cx, cy, csize = crop_coords
+            cx, cy, cw, ch = crop_coords
             # Protect bounds
             fh, fw = full_frame.shape[:2]
             cx = max(0, min(cx, fw - 1))
             cy = max(0, min(cy, fh - 1))
-            csize = min(csize, fw - cx, fh - cy)
+            cw = min(cw, fw - cx)
+            ch = min(ch, fh - cy)
             
-            if csize > 0:
-                ai_resized = cv2.resize(display_frame, (csize, csize))
+            if cw > 0 and ch > 0:
+                ai_resized = cv2.resize(display_frame, (cw, ch))
                 
-                hd_region = full_frame[cy:cy+csize, cx:cx+csize].copy()
+                hd_region = full_frame[cy:cy+ch, cx:cx+cw].copy()
                 
                 mask_resized = None
                 if soft_mask is not None:
-                    mask_resized = cv2.resize(soft_mask, (csize, csize))[..., np.newaxis]
+                    mask_resized = cv2.resize(soft_mask, (cw, ch))[..., np.newaxis]
                 
                 base_region = hd_region.astype(np.float32)
                 ai_region = ai_resized.astype(np.float32)
@@ -623,7 +624,7 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                 if mask_resized is not None:
                     final_ai = (final_ai * mask_resized) + (base_region * (1.0 - mask_resized))
                     
-                full_frame[cy:cy+csize, cx:cx+csize] = final_ai.astype(np.uint8)
+                full_frame[cy:cy+ch, cx:cx+cw] = final_ai.astype(np.uint8)
                 display_frame = full_frame
 
         # One transient send failure used to disable the virtual camera for the

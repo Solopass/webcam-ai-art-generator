@@ -36,6 +36,7 @@ def process_video():
     args.t_index = int(settings.get("ai_strength", args.t_index))
     args.post_processing = settings.get("post_processing", args.post_processing)
     args.composite = settings.get("composite", args.composite)
+    args.no_face_track = settings.get("no_face_track", False)
     
     vfx_blend_mode = settings.get("vfx_blend_mode", "Normal")
     vfx_opacity = settings.get("vfx_opacity", 1.0)
@@ -122,7 +123,14 @@ def process_video():
             
         x, y, s = int(current_x), int(current_y), int(current_size)
         
-        cropped = frame[y:y+s, x:x+s]
+        if args.no_face_track:
+            x, y = 0, 0
+            cw, ch = w, h
+            cropped = frame
+        else:
+            cw, ch = s, s
+            cropped = frame[y:y+ch, x:x+cw]
+            
         if cropped.size == 0:
             out.write(frame)
             continue
@@ -192,14 +200,15 @@ def process_video():
             vv = cv2.add(vv, 10)
             out_frame = cv2.cvtColor(cv2.merge((hh, ss, vv)), cv2.COLOR_HSV2BGR)
             
-        csize = min(s, w - x, h - y)
-        if csize > 0:
-            ai_resized = cv2.resize(out_frame, (csize, csize))
-            hd_region = full_frame[y:y+csize, x:x+csize].copy()
+        cw = min(cw, w - x)
+        ch = min(ch, h - y)
+        if cw > 0 and ch > 0:
+            ai_resized = cv2.resize(out_frame, (cw, ch))
+            hd_region = full_frame[y:y+ch, x:x+cw].copy()
             
             mask_resized = None
             if soft_mask is not None:
-                mask_resized = cv2.resize(soft_mask, (csize, csize))[..., np.newaxis]
+                mask_resized = cv2.resize(soft_mask, (cw, ch))[..., np.newaxis]
                 
             base_region = hd_region.astype(np.float32)
             ai_region = ai_resized.astype(np.float32)
@@ -246,7 +255,7 @@ def process_video():
             if mask_resized is not None:
                 final_ai = (final_ai * mask_resized) + (base_region * (1.0 - mask_resized))
                 
-            full_frame[y:y+csize, x:x+csize] = final_ai.astype(np.uint8)
+            full_frame[y:y+ch, x:x+cw] = final_ai.astype(np.uint8)
             
         out.write(full_frame)
         

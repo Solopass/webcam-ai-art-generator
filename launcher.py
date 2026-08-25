@@ -108,6 +108,7 @@ class VTuberStudioApp(ctk.CTk):
             "embedded_preview": self.preview_var.get(),
             "mirror_camera": self.mirror_var.get(),
             "virtual_camera": self.vcam_var.get(),
+            "no_face_track": self.no_face_track_var.get(),
             "audio_sync": self.audio_var.get(),
             "keep_background": self.bg_keep_var.get(),
             "normalize_lighting": self.clahe_var.get(),
@@ -608,7 +609,11 @@ class VTuberStudioApp(ctk.CTk):
                 
         ctk.CTkLabel(self.vfx_scroll, text="VFX Blend Mode:", anchor="w").pack(anchor="w")
         self.vfx_blend_menu = ctk.CTkOptionMenu(self.vfx_scroll, values=["Normal", "Screen", "Linear Dodge (Add)", "Color Dodge", "Overlay", "Soft Light", "Hard Light", "Multiply", "Darken", "Lighten", "Difference", "Exclusion"], variable=self.vfx_blend_var, command=_send_vfx_blend)
-        self.vfx_blend_menu.pack(fill=ctk.X, pady=(0,30))
+        self.vfx_blend_menu.pack(fill=ctk.X, pady=(0,15))
+        
+        self.no_face_track_var = ctk.BooleanVar(value=self.settings.get("no_face_track", False))
+        self.no_face_track_cb = ctk.CTkSwitch(self.vfx_scroll, text="Full Frame Mode (Disable Face Tracking)", variable=self.no_face_track_var)
+        self.no_face_track_cb.pack(anchor="w", pady=(0, 30))
         
         def _export_vfx():
             import subprocess
@@ -992,6 +997,8 @@ class VTuberStudioApp(ctk.CTk):
             cmd.append("--mirror_camera")
         if self.vcam_var.get():
             cmd.append("--virtual_camera")
+        if self.no_face_track_var.get():
+            cmd.append("--no_face_track")
         if self.audio_var.get():
             cmd.append("--audio_sync")
         if self.bg_keep_var.get():
@@ -1010,6 +1017,7 @@ class VTuberStudioApp(ctk.CTk):
         self.preview_cb.configure(state=state)
         self.mirror_cb.configure(state=state)
         self.vcam_cb.configure(state=state)
+        self.no_face_track_cb.configure(state=state)
         self.audio_cb.configure(state=state)
         self.bg_keep_cb.configure(state=state)
         self.bg_entry.configure(state=state)
