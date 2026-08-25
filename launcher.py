@@ -572,6 +572,24 @@ class VTuberStudioApp(ctk.CTk):
         ctk.CTkLabel(self.vfx_scroll, text="Offline Post-Production VFX", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(0,10))
         ctk.CTkLabel(self.vfx_scroll, text="Fine-tune your VFX settings over a loaded .mp4 video, and then render the final perfectly composited video.", wraplength=350, justify="left").pack(pady=(0,20))
         
+        self.vfx_vid_frame = ctk.CTkFrame(self.vfx_scroll, fg_color="transparent")
+        self.vfx_vid_frame.pack(fill=ctk.X, pady=(0, 20))
+        
+        self.vfx_video_entry = ctk.CTkEntry(self.vfx_vid_frame, placeholder_text="Path to .mp4 video...")
+        self.vfx_video_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True, padx=(0, 10))
+        
+        def _vfx_load_vid():
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(title="Select Video", filetypes=[("Video Files", "*.mp4 *.mov *.avi *.mkv"), ("All Files", "*.*")])
+            if path:
+                self.vfx_video_entry.delete(0, ctk.END)
+                self.vfx_video_entry.insert(0, path)
+                # Automatically set it in the main camera entry so "START ENGINE" previews it!
+                self.camera_entry.set(path)
+                
+        self.vfx_load_btn = ctk.CTkButton(self.vfx_vid_frame, text="📂 Load Video", width=100, command=_vfx_load_vid)
+        self.vfx_load_btn.pack(side=ctk.RIGHT)
+        
         def _send_vfx_op(v):
             if getattr(self, "cmd_socket", None):
                 try: self.cmd_socket.send_string(__import__("json").dumps({"vfx_opacity": float(v)}))
@@ -594,9 +612,9 @@ class VTuberStudioApp(ctk.CTk):
         
         def _export_vfx():
             import subprocess
-            video_path = self.cam_entry.get().strip()
+            video_path = self.vfx_video_entry.get().strip()
             if not video_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
-                self.log("[Error] You must load a video file in the 'Settings' tab to export Offline VFX!")
+                self.log("[Error] You must load a video file to export Offline VFX!")
                 return
                 
             self.save_settings()
