@@ -9,7 +9,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 from realtime_video import (
-    build_args, load_model_and_engine, refit_lora_to_trt, load_segmenter
+    build_args, load_model_and_engine, refit_lora_to_trt
 )
 
 def process_video():
@@ -71,7 +71,8 @@ def process_video():
     
     segmenter = None
     if args.composite:
-        segmenter = load_segmenter()
+        import mediapipe.python.solutions as mp_solutions
+        segmenter = mp_solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
         
     print(f"[Export] Starting Offline Render: {total_frames} frames...")
     
