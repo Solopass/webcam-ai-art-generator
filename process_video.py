@@ -206,13 +206,38 @@ def process_video():
             
             if vfx_blend_mode == "Screen":
                 blended = 255.0 - ((255.0 - base_region) * (255.0 - ai_region) / 255.0)
+            elif vfx_blend_mode == "Linear Dodge (Add)":
+                blended = np.clip(base_region + ai_region, 0, 255)
             elif vfx_blend_mode == "Color Dodge":
                 blended = np.clip(base_region / (1.0001 - ai_region/255.0), 0, 255)
             elif vfx_blend_mode == "Overlay":
-                m = base_region < 128
+                mask = base_region < 128
                 blended = np.empty_like(base_region)
-                blended[m] = 2.0 * base_region[m] * ai_region[m] / 255.0
-                blended[~m] = 255.0 - 2.0 * (255.0 - base_region[~m]) * (255.0 - ai_region[~m]) / 255.0
+                blended[mask] = 2.0 * base_region[mask] * ai_region[mask] / 255.0
+                blended[~mask] = 255.0 - 2.0 * (255.0 - base_region[~mask]) * (255.0 - ai_region[~mask]) / 255.0
+            elif vfx_blend_mode == "Hard Light":
+                mask = ai_region < 128
+                blended = np.empty_like(base_region)
+                blended[mask] = 2.0 * base_region[mask] * ai_region[mask] / 255.0
+                blended[~mask] = 255.0 - 2.0 * (255.0 - base_region[~mask]) * (255.0 - ai_region[~mask]) / 255.0
+            elif vfx_blend_mode == "Soft Light":
+                B_norm = base_region / 255.0
+                A_norm = ai_region / 255.0
+                mask = A_norm <= 0.5
+                blended = np.empty_like(base_region)
+                blended[mask] = B_norm[mask] - (1.0 - 2.0 * A_norm[mask]) * B_norm[mask] * (1.0 - B_norm[mask])
+                blended[~mask] = B_norm[~mask] + (2.0 * A_norm[~mask] - 1.0) * (np.sqrt(B_norm[~mask]) - B_norm[~mask])
+                blended *= 255.0
+            elif vfx_blend_mode == "Multiply":
+                blended = (base_region * ai_region) / 255.0
+            elif vfx_blend_mode == "Darken":
+                blended = np.minimum(base_region, ai_region)
+            elif vfx_blend_mode == "Lighten":
+                blended = np.maximum(base_region, ai_region)
+            elif vfx_blend_mode == "Difference":
+                blended = np.abs(base_region - ai_region)
+            elif vfx_blend_mode == "Exclusion":
+                blended = base_region + ai_region - (2.0 * base_region * ai_region) / 255.0
             else:
                 blended = ai_region
                 

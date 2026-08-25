@@ -607,7 +607,7 @@ class VTuberStudioApp(ctk.CTk):
                 except Exception: pass
                 
         ctk.CTkLabel(self.vfx_scroll, text="VFX Blend Mode:", anchor="w").pack(anchor="w")
-        self.vfx_blend_menu = ctk.CTkOptionMenu(self.vfx_scroll, values=["Normal", "Screen", "Color Dodge", "Overlay"], variable=self.vfx_blend_var, command=_send_vfx_blend)
+        self.vfx_blend_menu = ctk.CTkOptionMenu(self.vfx_scroll, values=["Normal", "Screen", "Linear Dodge (Add)", "Color Dodge", "Overlay", "Soft Light", "Hard Light", "Multiply", "Darken", "Lighten", "Difference", "Exclusion"], variable=self.vfx_blend_var, command=_send_vfx_blend)
         self.vfx_blend_menu.pack(fill=ctk.X, pady=(0,30))
         
         def _export_vfx():
