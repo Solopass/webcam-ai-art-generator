@@ -57,7 +57,10 @@ def open_log():
 
 def log(msg):
     """Unbuffered print so the GUI log box updates live; mirrored to disk."""
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(str(msg).encode('utf-8', 'replace').decode('cp1252', 'replace'), flush=True)
     if _log_file:
         line = f"{time.strftime('%H:%M:%S')} {msg}\n"
         for fh in _log_file:
@@ -703,6 +706,7 @@ def build_args():
     parser.add_argument("--freeze_threshold", type=float, default=0.98)
     parser.add_argument("--motion_smoothing", type=float, default=0.6)
     parser.add_argument("--bokeh_blur", type=float, default=0.0)
+    parser.add_argument("--zoom", type=float, default=1.0)
     parser.add_argument("--expr_overrides", type=str, default="{}")
     parser.add_argument("--sens_overrides", type=str, default="{}")
     parser.add_argument("--t_index", type=int, default=32,
