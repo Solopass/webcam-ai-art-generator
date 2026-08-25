@@ -347,7 +347,13 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
         current_x = int(current_x * 0.8 + target_x * 0.2)
         current_y = int(current_y * 0.8 + target_y * 0.2)
 
-        cropped = frame[current_y:current_y + size, current_x:current_x + size]
+        if args.no_face_track:
+            cw, ch = w, h
+            cropped = frame
+        else:
+            cw, ch = size, size
+            cropped = frame[current_y:current_y + size, current_x:current_x + size]
+        
         resized = cv2.resize(cropped, (512, 512))
         frame_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
