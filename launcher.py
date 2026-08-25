@@ -50,7 +50,7 @@ class VTuberStudioApp(ctk.CTk):
         super().__init__()
 
         self.title("Antigravity VTuber Studio")
-        self.geometry("1200x900")
+        self.geometry("1400x1000")
         self.minsize(900, 700)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -64,6 +64,9 @@ class VTuberStudioApp(ctk.CTk):
         self.bind("<Control-s>", lambda e: self.save_replay())
         self.bind("<Control-r>", lambda e: self.randomize_prompt())
         self.bind("<F12>", lambda e: self.take_snapshot())
+        self.bind("<Control-space>", lambda e: self.take_snapshot())
+        self.bind("<Control-f>", lambda e: self.toggle_freeze())
+        self.bind("<F8>", lambda e: self.toggle_freeze())
 
         # Threading for non-blocking save
         self.saving = False
@@ -119,6 +122,7 @@ class VTuberStudioApp(ctk.CTk):
             "freeze": self.freeze_var.get(),
             "motion_smoothing": self.motion_var.get(),
             "bokeh_blur": self.bokeh_var.get(),
+            "zoom": self.zoom_var.get(),
             "normalize_lighting": self.clahe_var.get(),
             "cuda_graph": self.cudagraph_var.get()
         }
@@ -145,8 +149,24 @@ class VTuberStudioApp(ctk.CTk):
         self.left_col = ctk.CTkFrame(self.main_frame)
         self.left_col.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True, padx=(0, 10))
 
-        self.right_col = ctk.CTkScrollableFrame(self.main_frame, width=290)
-        self.right_col.pack(side=ctk.RIGHT, fill=ctk.Y)
+        self.right_container = ctk.CTkFrame(self.main_frame, width=400)
+        self.right_container.pack(side=ctk.RIGHT, fill=ctk.Y)
+        
+        self.tabview = ctk.CTkTabview(self.right_container, width=400)
+        self.tabview.pack(fill=ctk.BOTH, expand=True)
+        
+        self.tab_settings = self.tabview.add("Settings")
+        self.tab_advanced = self.tabview.add("Advanced")
+        self.tab_system = self.tabview.add("System")
+        
+        self.right_col = ctk.CTkScrollableFrame(self.tab_settings)
+        self.right_col.pack(fill=ctk.BOTH, expand=True)
+        
+        self.advanced_col = ctk.CTkScrollableFrame(self.tab_advanced)
+        self.advanced_col.pack(fill=ctk.BOTH, expand=True)
+        
+        self.system_col = ctk.CTkFrame(self.tab_system)
+        self.system_col.pack(fill=ctk.BOTH, expand=True)
 
         # --- LEFT: prompting + preview ---
         prompt_builder_frame = ctk.CTkFrame(self.left_col, fg_color="transparent")
@@ -207,27 +227,7 @@ class VTuberStudioApp(ctk.CTk):
 
         build_dropdowns()
 
-        prompt_row = ctk.CTkFrame(self.left_col, fg_color="transparent")
-        prompt_row.pack(fill=ctk.X, padx=10, pady=5)
-        
-        self.prompt_entry = ctk.CTkEntry(prompt_row, placeholder_text="Master Prompt...")
-        self.prompt_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True)
-        
-        def save_to_md():
-            current = self.prompt_entry.get().strip()
-            if not current: return
-            md_path = os.path.join(SCRIPT_DIR, "prompts.md")
-            with open(md_path, 'a', encoding='utf-8') as f:
-                f.write(f"\n{current}\n")
-            build_dropdowns()
-            
-        ctk.CTkButton(prompt_row, text="💾 Save", width=60, command=save_to_md, hover_color="#333333").pack(side=ctk.LEFT, padx=5)
-        self.apply_btn = ctk.CTkButton(prompt_row, text="Apply ⏎", width=86, command=self.apply_prompt)
-        self.apply_btn.pack(side=ctk.LEFT, padx=(6, 0))
-
-        def build_prompt_header(label_text, entry_box, settings_key):
-            header = ctk.CTkFrame(self.left_col, fg_color="transparent")
-            header.pack(fill=ctk.X, padx=10, pady=(10, 0))
+        def build_prompt_header(label_text, entry_box, settings_key, header):
             saved = self.settings.get(settings_key, [])
             
             def on_select(val):
@@ -245,16 +245,45 @@ class VTuberStudioApp(ctk.CTk):
                     self.save_settings()
                     dropdown.configure(values=[label_text] + saved)
                     
+            def on_delete():
+                current = entry_box.get().strip()
+                if current in saved:
+                    saved.remove(current)
+                    self.settings[settings_key] = saved
+                    self.save_settings()
+                    dropdown.configure(values=[label_text] + saved)
+                    entry_box.delete(0, 'end')
+                    self.apply_prompt()
+                    
             dropdown = ctk.CTkOptionMenu(header, values=[label_text] + saved, command=on_select,
                                          text_color=("black", "white"))
             dropdown.set(label_text)
             dropdown.pack(side=ctk.LEFT)
             ctk.CTkButton(header, text="💾", width=30, height=24, fg_color="transparent",
-                          command=on_save, hover_color="#333333").pack(side=ctk.LEFT, padx=5)
+                          command=on_save, hover_color="#333333").pack(side=ctk.LEFT, padx=(5, 0))
+            ctk.CTkButton(header, text="🗑️", width=30, height=24, fg_color="transparent",
+                          command=on_delete, hover_color="#333333").pack(side=ctk.LEFT, padx=5)
 
+
+        header_main = ctk.CTkFrame(self.left_col, fg_color="transparent")
+        header_main.pack(fill=ctk.X, padx=10, pady=(10, 0))
+        
+        prompt_row = ctk.CTkFrame(self.left_col, fg_color="transparent")
+        prompt_row.pack(fill=ctk.X, padx=10, pady=5)
+        
+        self.prompt_entry = ctk.CTkEntry(prompt_row, placeholder_text="Master Prompt...")
+        self.prompt_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True)
+        
+        build_prompt_header("Saved Prompts 💾", self.prompt_entry, "saved_main_prompts", header_main)
+        
+        self.apply_btn = ctk.CTkButton(prompt_row, text="Apply ✨", width=86, command=self.apply_prompt)
+        self.apply_btn.pack(side=ctk.LEFT, padx=(6, 0))
+
+        header_neg = ctk.CTkFrame(self.left_col, fg_color="transparent")
+        header_neg.pack(fill=ctk.X, padx=10, pady=(10, 0))
         self.neg_prompt_entry = ctk.CTkEntry(self.left_col)
-        build_prompt_header("Negative Prompt ▾", self.neg_prompt_entry, "saved_neg_prompts")
         self.neg_prompt_entry.pack(fill=ctk.X, padx=10, pady=5)
+        build_prompt_header("Negative Prompt 🚫", self.neg_prompt_entry, "saved_neg_prompts", header_neg)
 
         # Pressing Enter in either box pushes the text to a running engine over
         # the same command channel the randomizer uses. Without this the boxes
@@ -274,14 +303,15 @@ class VTuberStudioApp(ctk.CTk):
 
         self.settings_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
         self.settings_frame.pack(fill=ctk.X, padx=10)
+        self.settings_frame.columnconfigure(1, weight=1)
 
         ctk.CTkLabel(self.settings_frame, text="Camera Index:", anchor="w").grid(
-            row=0, column=0, padx=5, pady=5, sticky="w")
+            row=0, column=0, padx=5, pady=5, sticky="ew")
         self.camera_entry = ctk.CTkComboBox(self.settings_frame, width=150, values=["0", "1", "screen 1 (Primary)", "screen 2 (Secondary)", "screen 3 (Tertiary)"])
-        self.camera_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.camera_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
         ctk.CTkLabel(self.settings_frame, text="Character (LoRA):", anchor="w").grid(
-            row=1, column=0, padx=5, pady=5, sticky="w")
+            row=1, column=0, padx=5, pady=5, sticky="ew")
         lora_dir = os.path.join(SCRIPT_DIR, "loras")
         loras = ["None (Original Default)"]
         if os.path.isdir(lora_dir):
@@ -298,28 +328,28 @@ class VTuberStudioApp(ctk.CTk):
         self.lora_var = ctk.StringVar(value=saved_lora if saved_lora in loras else "None (Original Default)")
         self.lora_dropdown = ctk.CTkOptionMenu(self.settings_frame, variable=self.lora_var,
                                                values=loras, width=140, command=on_lora_changed)
-        self.lora_dropdown.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self.lora_dropdown.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
         ctk.CTkLabel(self.settings_frame, text="ControlNet Mode:", anchor="w").grid(
-            row=2, column=0, padx=5, pady=5, sticky="w")
+            row=2, column=0, padx=5, pady=5, sticky="ew")
         saved_cnet = self.settings.get("controlnet", "None")
         self.controlnet_var = ctk.StringVar(value=saved_cnet)
         self.controlnet_dropdown = ctk.CTkOptionMenu(
             self.settings_frame, variable=self.controlnet_var,
-            values=["None", "Depth (MiDaS)"], width=140)
-        self.controlnet_dropdown.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+            values=["None", "Depth (MiDaS)", "Canny Edge (Details)", "Lineart (Sketches)", "OpenPose (Skeletal)", "Depth + Canny (Heavy/Low FPS)"], width=140)
+        self.controlnet_dropdown.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
 
         ctk.CTkLabel(self.settings_frame, text="Performance Mode:", anchor="w").grid(
-            row=3, column=0, padx=5, pady=5, sticky="w")
+            row=3, column=0, padx=5, pady=5, sticky="ew")
         perf_modes = [
-            "Ultra Low Latency (2-Step, 1-Frame Batch)",
-            "High FPS (2-Step, 2-Frame Batch)",
-            "High Quality (4-Step, 1-Frame Batch)"
+            "Maximum Speed (Low Quality)",
+            "Balanced (Recommended for ControlNet)",
+            "Maximum Quality (Low FPS)"
         ]
-        saved_perf = self.settings.get("perf_mode", "Ultra Low Latency (2-Step, 1-Frame Batch)")
-        self.perf_var = ctk.StringVar(value=saved_perf if saved_perf in perf_modes else perf_modes[0])
+        saved_perf = self.settings.get("perf_mode", "Maximum Speed (Low Quality)")
+        self.perf_var = ctk.StringVar(value=saved_perf if saved_perf in perf_modes else perf_modes[1])
         self.perf_dropdown = ctk.CTkOptionMenu(self.settings_frame, variable=self.perf_var, values=perf_modes, width=140)
-        self.perf_dropdown.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+        self.perf_dropdown.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
 
         # Toggles
         self.preview_var = ctk.BooleanVar(value=self.settings.get("embedded_preview", True))
@@ -365,18 +395,18 @@ class VTuberStudioApp(ctk.CTk):
         self.bg_clear_btn.pack(side=ctk.LEFT)
 
         # --- Advanced tuning ---
-        ctk.CTkLabel(self.right_col, text="Advanced Tuning:", anchor="w",
+        ctk.CTkLabel(self.advanced_col, text="Advanced Tuning:", anchor="w",
                      font=ctk.CTkFont(size=14, weight="bold")).pack(
             fill=ctk.X, padx=10, pady=(15, 5))
 
-        self.tune_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
+        self.tune_frame = ctk.CTkFrame(self.advanced_col, fg_color="transparent")
         self.tune_frame.pack(fill=ctk.X, padx=10)
         self.tune_frame.grid_columnconfigure(1, weight=1)
 
         self.strength_var = ctk.DoubleVar(value=self.settings.get("ai_strength", 40.0))
         self._slider_row(0, "AI Strength", self.strength_var, 0, 100, 20,
                          fmt=lambda v: f"{int(v)} (step {strength_to_t_index(v)})",
-                         desc="Higher = closer to raw webcam, Lower = more AI stylization.")
+                         desc="Higher = closer to raw webcam, Lower = more AI stylization. (Requires Restart)")
 
         # Floor of 1.05, not 1.0: at exactly 1.0 StreamDiffusion disables
         # classifier-free guidance entirely, which halves the prompt-embed
@@ -404,7 +434,7 @@ class VTuberStudioApp(ctk.CTk):
                          on_change=_send_freeze,
                          desc="Pauses generation when you sit perfectly still to increase visual quality.")
 
-        self.motion_var = ctk.DoubleVar(value=self.settings.get("motion_smoothing", 0.6))
+        self.motion_var = ctk.DoubleVar(value=self.settings.get("motion_smoothing", 0.0))
         self._slider_row(3, "Motion Blur", self.motion_var, 0.0, 0.9, 90,
                          fmt=lambda v: "off" if v < 0.01 else f"{v:.2f}",
                          on_change=_send_motion,
@@ -421,6 +451,17 @@ class VTuberStudioApp(ctk.CTk):
                          on_change=_send_bokeh,
                          desc="Artificially blurs the real room behind the AI character (only works if 'Composite Real Background' is checked).")
 
+        def _send_zoom(v):
+            if getattr(self, "cmd_socket", None):
+                try: self.cmd_socket.send_string(__import__("json").dumps({"zoom": float(v)}))
+                except Exception: pass
+
+        self.zoom_var = ctk.DoubleVar(value=self.settings.get("zoom", 1.0))
+        self._slider_row(5, "Camera Zoom", self.zoom_var, 1.0, 3.0, 40,
+                         fmt=lambda v: f"{v:.1f}x",
+                         on_change=_send_zoom,
+                         desc="Zooms the camera in to focus tighter on your face.")
+
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         self.clahe_cb = ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
                                       variable=self.clahe_var)
@@ -432,10 +473,10 @@ class VTuberStudioApp(ctk.CTk):
         self.cudagraph_cb.pack(anchor="w", padx=15, pady=4)
 
         # Expressions
-        ctk.CTkLabel(self.right_col, text="Expression Overrides",
+        ctk.CTkLabel(self.advanced_col, text="Expression Overrides",
                      font=ctk.CTkFont(size=14, weight="bold")).pack(fill=ctk.X, padx=10, pady=(15, 5))
         
-        self.expr_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
+        self.expr_frame = ctk.CTkFrame(self.advanced_col, fg_color="transparent")
         self.expr_frame.pack(fill=ctk.X, padx=10)
         
         self.expr_vars = {}
@@ -451,10 +492,10 @@ class VTuberStudioApp(ctk.CTk):
             var.trace_add("write", make_cb(expr, var))
 
         # Sensitivities
-        ctk.CTkLabel(self.right_col, text="Trigger Sensitivities",
+        ctk.CTkLabel(self.advanced_col, text="Trigger Sensitivities",
                      font=ctk.CTkFont(size=14, weight="bold")).pack(fill=ctk.X, padx=10, pady=(15, 5))
         
-        self.sens_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
+        self.sens_frame = ctk.CTkFrame(self.advanced_col, fg_color="transparent")
         self.sens_frame.pack(fill=ctk.X, padx=10)
         
         self.sens_vars = {}
@@ -473,9 +514,9 @@ class VTuberStudioApp(ctk.CTk):
             slider.grid(row=i, column=1, sticky="ew", padx=(10, 0), pady=2)
 
         # Logs
-        ctk.CTkLabel(self.right_col, text="Engine Logs:", anchor="w").pack(
+        ctk.CTkLabel(self.system_col, text="Engine Logs:", anchor="w").pack(
             fill=ctk.X, padx=10, pady=(10, 0))
-        self.log_box = ctk.CTkTextbox(self.right_col, state="disabled", wrap="word",
+        self.log_box = ctk.CTkTextbox(self.system_col, state="disabled", wrap="word",
                                       fg_color="#1E1E1E", height=140)
         self.log_box.pack(fill=ctk.BOTH, expand=True, padx=10, pady=(2, 5))
 
@@ -488,28 +529,32 @@ class VTuberStudioApp(ctk.CTk):
         self.zmq_socket.setsockopt(zmq.CONFLATE, 1)
         self.zmq_socket.setsockopt(zmq.LINGER, 0)
 
-        self.random_btn = ctk.CTkButton(self.right_col, text="🎲 Randomize Style (Ctrl+R)",
+        self.random_btn = ctk.CTkButton(self.right_container, text="🎲 Randomize Style (Ctrl+R)",
                                         command=self.randomize_prompt)
         self.random_btn.pack(fill=ctk.X, padx=10, pady=5)
         
-        self.snapshot_btn = ctk.CTkButton(self.right_col, text="🖼️ Take Snapshot (F12)",
+        self.freeze_btn = ctk.CTkButton(self.right_container, text="❄️ Manual Freeze (F8)",
+                                        command=self.toggle_freeze, fg_color=["#3a7ebf", "#1f538d"], hover_color=["#325882", "#14375e"])
+        self.freeze_btn.pack(fill=ctk.X, padx=10, pady=5)
+        
+        self.snapshot_btn = ctk.CTkButton(self.right_container, text="🖼️ Take Snapshot (F12)",
                                           command=self.take_snapshot)
         self.snapshot_btn.pack(fill=ctk.X, padx=10, pady=5)
         
-        self.replay_btn = ctk.CTkButton(self.right_col, text="📷 Save 5s WebP Replay (Ctrl+S)",
+        self.replay_btn = ctk.CTkButton(self.right_container, text="📷 Save 5s WebP Replay (Ctrl+S)",
                                         command=self.save_replay)
         self.replay_btn.pack(fill=ctk.X, padx=10, pady=5)
         
-        self.record_btn = ctk.CTkButton(self.right_col, text="🔴 Start Recording",
+        self.record_btn = ctk.CTkButton(self.right_container, text="🔴 Start Recording",
                                         command=self.toggle_recording, fg_color="#d9534f", hover_color="#c9302c")
         self.record_btn.pack(fill=ctk.X, padx=10, pady=5)
 
-        self.start_btn = ctk.CTkButton(self.right_col, text="▶ START ENGINE",
+        self.start_btn = ctk.CTkButton(self.right_container, text="▶ START ENGINE",
                                        fg_color="#28a745", hover_color="#218838",
                                        command=self.start_script)
         self.start_btn.pack(fill=ctk.X, padx=10, pady=(20, 8))
 
-        self.stop_btn = ctk.CTkButton(self.right_col, text="■ STOP", fg_color="#dc3545",
+        self.stop_btn = ctk.CTkButton(self.right_container, text="■ STOP", fg_color="#dc3545",
                                       hover_color="#c82333", state="disabled",
                                       command=self.stop_script)
         self.stop_btn.pack(fill=ctk.X, padx=10, pady=(0, 10))
@@ -520,7 +565,7 @@ class VTuberStudioApp(ctk.CTk):
     def _slider_row(self, row, label, var, lo, hi, steps, fmt, desc=None, on_change=None):
         r = row * 2
         ctk.CTkLabel(self.tune_frame, text=f"{label}:", anchor="w").grid(
-            row=r, column=0, padx=2, pady=3, sticky="w")
+            row=r, column=0, padx=2, pady=3, sticky="ew")
         value_label = ctk.CTkLabel(self.tune_frame, text=fmt(var.get()), width=90, anchor="e")
         value_label.grid(row=r, column=2, padx=2, pady=3, sticky="e")
         
@@ -535,7 +580,7 @@ class VTuberStudioApp(ctk.CTk):
         
         if desc:
             desc_label = ctk.CTkLabel(self.tune_frame, text=desc, font=ctk.CTkFont(size=11), text_color="gray", justify="left", wraplength=350)
-            desc_label.grid(row=r+1, column=0, columnspan=3, padx=2, pady=(0, 10), sticky="w")
+            desc_label.grid(row=r+1, column=0, columnspan=3, padx=2, pady=(0, 10), sticky="ew")
 
     def select_bg(self):
         from tkinter import filedialog
@@ -578,6 +623,18 @@ class VTuberStudioApp(ctk.CTk):
                     except zmq.Again:
                         break
                 if latest:
+                    is_engine_frozen = False
+                    if len(latest) > 0 and latest[0] in (0, 1):
+                        is_engine_frozen = latest[0] == 1
+                        latest = latest[1:]
+                    
+                    if is_engine_frozen:
+                        self.freeze_btn.configure(text="[ AI FROZEN ]", fg_color="#d9534f", hover_color="#c9302c")
+                    elif getattr(self, "manual_freeze", False):
+                        self.freeze_btn.configure(text="⏸ Unfreeze (F8)", fg_color="#5cb85c", hover_color="#4cae4c")
+                    else:
+                        self.freeze_btn.configure(text="❄️ Manual Freeze (F8)", fg_color=["#3a7ebf", "#1f538d"], hover_color=["#325882", "#14375e"])
+
                     img_np = cv2.imdecode(np.frombuffer(latest, np.uint8), cv2.IMREAD_COLOR)
             except Exception:
                 img_np = None
@@ -666,26 +723,29 @@ class VTuberStudioApp(ctk.CTk):
         # Same path as typing a prompt and pressing Enter.
         self.apply_prompt(quiet=True)
             
-    def take_snapshot(self):
-        if len(self.frame_buffer) == 0:
-            self.log("[Engine] No frame available to snapshot yet.")
-            return
+    def toggle_freeze(self):
+        self.manual_freeze = not getattr(self, "manual_freeze", False)
+        if getattr(self, "cmd_socket", None):
+            import json
+            self.cmd_socket.send_string(json.dumps({"manual_freeze": self.manual_freeze}))
+            if self.manual_freeze:
+                self.log("[Engine] Manual Freeze ON: Refining current frame.")
+                self.freeze_btn.configure(text="▶ Unfreeze (F8)", fg_color="#5cb85c", hover_color="#4cae4c")
+            else:
+                self.log("[Engine] Manual Freeze OFF: Resumed webcam.")
+                self.freeze_btn.configure(text="❄️ Manual Freeze (F8)", fg_color=["#3a7ebf", "#1f538d"], hover_color=["#325882", "#14375e"])
+        else:
+            self.log("[Engine] Cannot freeze: Engine is not running.")
             
-        import cv2
-        from datetime import datetime
+    def take_snapshot(self):
+        # We now send a command to the engine to save the high-res uncompressed frames!
+        if getattr(self, "cmd_socket", None):
+            import json
+            self.cmd_socket.send_string(json.dumps({"save_snapshot": True}))
+            self.log("[Engine] Requested high-res snapshot from engine...")
+        else:
+            self.log("[Engine] Cannot save snapshot: Engine is not running.")
 
-        out_dir = os.path.join(SCRIPT_DIR, "snapshots")
-        os.makedirs(out_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(out_dir, f"snapshot_{ts}.png")
-
-        # The newest frame off the preview stream. Note this is the engine's
-        # 512x512 output after JPEG transport, not a separate high-resolution
-        # render — the button used to claim otherwise.
-        frame = self.frame_buffer[-1]
-        cv2.imwrite(filename, frame)
-        self.log(f"[Snapshot] Saved {frame.shape[1]}x{frame.shape[0]} snapshot to {filename}")
-        
     def toggle_recording(self):
         import os
         import imageio
@@ -808,9 +868,9 @@ class VTuberStudioApp(ctk.CTk):
             neg_val = neg_val + ", EasyNegative" if neg_val else "EasyNegative"
             
         perf = self.perf_var.get()
-        if perf == "High FPS (2-Step, 2-Frame Batch)":
-            fb, steps = 2, 2
-        elif perf == "High Quality (4-Step, 1-Frame Batch)":
+        if perf == "Balanced (Recommended for ControlNet)":
+            fb, steps = 1, 2
+        elif perf == "Maximum Quality (Low FPS)":
             fb, steps = 1, 4
         else:
             fb, steps = 1, 2
@@ -818,6 +878,14 @@ class VTuberStudioApp(ctk.CTk):
         cnet_val = self.controlnet_var.get()
         if cnet_val == "Depth (MiDaS)":
             cnet_cmd = "depth"
+        elif cnet_val == "Canny Edge (Details)":
+            cnet_cmd = "canny"
+        elif cnet_val == "Lineart (Sketches)":
+            cnet_cmd = "lineart"
+        elif cnet_val == "OpenPose (Skeletal)":
+            cnet_cmd = "openpose"
+        elif cnet_val == "Depth + Canny (Heavy/Low FPS)":
+            cnet_cmd = "multi"
         else:
             cnet_cmd = "none"
 
@@ -836,6 +904,7 @@ class VTuberStudioApp(ctk.CTk):
             "--freeze_threshold", f"{self.freeze_var.get():.3f}",
             "--motion_smoothing", f"{self.motion_var.get():.2f}",
             "--bokeh_blur", f"{self.bokeh_var.get():.2f}",
+            "--zoom", f"{self.zoom_var.get():.2f}",
             "--expr_overrides", json.dumps({e: v.get() for e, v in self.expr_vars.items()}),
             "--sens_overrides", json.dumps({k: v.get() for k, v in self.sens_vars.items()}),
             "--zmq_port", str(zmq_port),

@@ -278,7 +278,7 @@ def scan_cameras(limit=6):
 
 
 # ---------------------------------------------------------- camera thread ----
-def camera_thread(cap, args, state_dict):
+def camera_thread(cap, args, state_dict, controlnet_aux_models):
     import mediapipe.python.solutions as mp_solutions
 
     # Always use selfie segmentation to isolate the user from the background
@@ -315,7 +315,8 @@ def camera_thread(cap, args, state_dict):
             frame = cv2.flip(frame, 1)
 
         h, w = frame.shape[:2]
-        size = min(h, w)
+        zoom = state_dict.get("zoom", getattr(args, "zoom", 1.0))
+        size = int(min(h, w) / zoom)
 
         if target_x == -1:
             target_x = (w - size) // 2
@@ -431,6 +432,29 @@ def camera_thread(cap, args, state_dict):
             except Exception:
                 pass
 
+        # Calculate ControlNet Depth Map (Async to GPU render)
+        cond_final = None
+        if len(controlnet_aux_models) > 0:
+            import torchvision.transforms.functional as TF
+            import torch
+            from PIL import Image
+            cond_tensors = []
+            for net_type in ["depth", "canny", "lineart", "openpose"]:
+                if net_type in controlnet_aux_models:
+                    aux = controlnet_aux_models[net_type]
+                    # ControlNet detectors typically take PIL Image or Numpy
+                    with torch.no_grad():
+                        cond_pil = aux(Image.fromarray(frame_rgb))
+                    c_tensor = TF.to_tensor(cond_pil).unsqueeze(0).to(dtype=torch.float16, device="cuda")
+                    # True Green Screen: Multiply depth map by soft_mask so background stays empty
+                    if soft_mask is not None:
+                        # soft_mask is [H, W] float32 in [0, 1]
+                        mask_tensor = torch.from_numpy(soft_mask).unsqueeze(0).unsqueeze(0).to(device=c_tensor.device, dtype=c_tensor.dtype)
+                        c_tensor = c_tensor * mask_tensor
+                    cond_tensors.append(c_tensor)
+            if len(cond_tensors) > 0:
+                cond_final = torch.cat(cond_tensors, dim=1)
+
         # Always keep the freshest frame waiting in the slot. Skipping the work
         # whenever the slot was full (an earlier "optimisation" of mine) served
         # the camera wait and the CPU preprocessing *in series* with the GPU
@@ -442,7 +466,7 @@ def camera_thread(cap, args, state_dict):
             except queue.Empty:
                 pass
         try:
-            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions))
+            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final))
         except queue.Full:
             pass
 
@@ -466,6 +490,9 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
     # must not assume its own reference is still live.
     vcam_retry_at = 0.0
     vcam_failures = 0
+    
+    last_target_time = time.time()
+    engine_fps_estimate = 30.0
 
     while not STOP.is_set():
         t0 = time.perf_counter()
@@ -473,17 +500,40 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
             item = Q_OUT.get_nowait()
             if item is None:
                 break
-            raw_out_frame, soft_mask, original_frame_rgb = item
+            
+            is_frozen = False
+            if len(item) == 5:
+                raw_out_frame, soft_mask, original_frame_rgb, cond_final, is_frozen = item
+            elif len(item) == 4:
+                raw_out_frame, soft_mask, original_frame_rgb, cond_final = item
+            else:
+                raw_out_frame, soft_mask, original_frame_rgb = item
+                cond_final = None
     
-            # Post-process the newly arrived frame
-            gaussian = cv2.GaussianBlur(raw_out_frame, (0, 0), 1.5)
-            out_frame = cv2.addWeighted(raw_out_frame, 1.4, gaussian, -0.4, 0)
-    
-            hsv = cv2.cvtColor(out_frame, cv2.COLOR_BGR2HSV)
-            h, s, v = cv2.split(hsv)
-            s = cv2.add(s, 20)
-            v = cv2.add(v, 10)
-            out_frame = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+            if args.post_processing:
+                gaussian = cv2.GaussianBlur(raw_out_frame, (0, 0), 1.5)
+                out_frame = cv2.addWeighted(raw_out_frame, 1.4, gaussian, -0.4, 0)
+        
+                hsv = cv2.cvtColor(out_frame, cv2.COLOR_BGR2HSV)
+                h, s, v = cv2.split(hsv)
+                s = cv2.add(s, 20)
+                v = cv2.add(v, 10)
+                out_frame = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+            else:
+                out_frame = raw_out_frame
+                
+            if state_dict.pop("save_snapshot", False):
+                save_dir = os.path.join(SCRIPT_DIR, "snapshots")
+                os.makedirs(save_dir, exist_ok=True)
+                ts = int(time.time() * 1000)
+                cv2.imwrite(os.path.join(save_dir, f"snap_{ts}_ai.png"), out_frame)
+                cv2.imwrite(os.path.join(save_dir, f"snap_{ts}_webcam.png"), cv2.cvtColor(original_frame_rgb, cv2.COLOR_RGB2BGR))
+                if cond_final is not None:
+                    import torch
+                    cond_img = (cond_final[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    cond_img = cv2.cvtColor(cond_img, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(save_dir, f"snap_{ts}_edges.png"), cond_img)
+                log(f"[Engine] Saved high-res snapshot to snapshots/snap_{ts}_*.png")
     
             if soft_mask is not None:
                 alpha = soft_mask[..., np.newaxis].astype(np.float32)
@@ -499,6 +549,13 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                     out_frame = (out_frame.astype(np.float32) * alpha + bg_to_use.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
             
             target_frame = out_frame.astype(np.float32)
+            
+            now = time.time()
+            dt = now - last_target_time
+            if dt > 0.001:
+                engine_fps_estimate = engine_fps_estimate * 0.8 + (1.0 / dt) * 0.2
+            last_target_time = now
+            
             if current_smoothed_frame is None:
                 current_smoothed_frame = target_frame.copy()
         except queue.Empty:
@@ -548,7 +605,8 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
             ok, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             if ok:
                 try:
-                    zmq_socket.send(buffer.tobytes())
+                    status_byte = b'\x01' if is_frozen else b'\x00'
+                    zmq_socket.send(status_byte + buffer.tobytes())
                 except Exception:
                     pass
         
@@ -602,6 +660,7 @@ def build_args():
     parser.add_argument("--cfg_type", type=str, default="full",
                         choices=["none", "self", "initialize", "full"])
     parser.add_argument("--mirror_camera", action="store_true")
+    parser.add_argument("--post_processing", action="store_true")
     parser.add_argument("--virtual_camera", action="store_true")
     parser.add_argument("--zmq_port", type=int, default=-1)
     parser.add_argument("--cmd_port", type=int, default=-1)
@@ -621,7 +680,7 @@ def build_args():
                         help="~10%% faster but has been observed to emit stale / "
                              "corrupted frames on some driver versions.")
     parser.add_argument("--controlnet", type=str, default="none",
-                        choices=["none", "depth"],
+                        choices=["none", "depth", "canny", "lineart", "openpose", "multi"],
                         help="Enable ControlNet preprocessor and engine.")
 
     args, unknown = parser.parse_known_args()
@@ -687,6 +746,12 @@ def cmd_listener_thread(port, state_dict):
                         if "bokeh_blur" in cmd:
                             state_dict["bokeh_blur"] = cmd["bokeh_blur"]
                             log(f"[Engine] Bokeh Blur: {cmd['bokeh_blur']}")
+                        if "zoom" in cmd:
+                            state_dict["zoom"] = cmd["zoom"]
+                            log(f"[Engine] Zoom: {cmd['zoom']}")
+                        if "guidance_scale" in cmd:
+                            state_dict["guidance_scale"] = cmd["guidance_scale"]
+                            log(f"[Engine] CFG: {cmd['guidance_scale']}")
                         if "expr_override" in cmd:
                             if "expr_overrides" not in state_dict:
                                 state_dict["expr_overrides"] = {}
@@ -751,7 +816,7 @@ def load_model_and_engine(args, lora_name):
         pipe,
         t_index_list=t_list,
         torch_dtype=torch.float16,
-        cfg_type="full",
+        cfg_type=args.cfg_type,
         do_add_noise=True,
         use_denoising_batch=True,
         frame_buffer_size=args.frame_buffer,
@@ -776,29 +841,40 @@ def load_model_and_engine(args, lora_name):
         },
     )
 
-    depth_estimator = None
-    if args.controlnet == "depth":
+    controlnet_aux_models = {}
+    if args.controlnet != "none":
         from streamdiffusion.acceleration.tensorrt.engine import UNet2DConditionModelEngine
-        from controlnet_aux import MidasDetector
+        from controlnet_aux import MidasDetector, CannyDetector, LineartDetector, OpenposeDetector
         
-        controlnet_engine_path = os.path.join(SCRIPT_DIR, "engines_controlnet", "unet_depth.engine")
+        controlnet_engine_path = os.path.join(SCRIPT_DIR, "engines_controlnet", f"unet_{args.controlnet}.engine")
         if not os.path.exists(controlnet_engine_path):
-            log(f"[FATAL] ControlNet engine not found at {controlnet_engine_path}.")
+            log(f"[FATAL] ControlNet engine not found at {controlnet_engine_path}. Please run compile_controlnet_fused.py --type {args.controlnet}")
             sys.exit(1)
             
-        log("[Engine] Swapping base UNet engine with fused ControlNet Depth engine...")
+        log(f"[Engine] Swapping base UNet engine with fused ControlNet {args.controlnet} engine...")
         stream.unet = UNet2DConditionModelEngine(
             controlnet_engine_path, 
             stream.unet.stream, 
             use_cuda_graph=args.cuda_graph
         )
         
-        log("[Engine] Loading MiDaS Depth Estimator...")
-        depth_estimator = MidasDetector.from_pretrained("lllyasviel/Annotators").to("cuda")
+        log(f"[Engine] Loading {args.controlnet} Estimator(s)...")
+        if args.controlnet in ["depth", "multi"]:
+            controlnet_aux_models["depth"] = MidasDetector.from_pretrained("lllyasviel/Annotators").to("cuda")
+        if args.controlnet in ["canny", "multi"]:
+            controlnet_aux_models["canny"] = CannyDetector()
+        if args.controlnet == "lineart":
+            controlnet_aux_models["lineart"] = LineartDetector.from_pretrained("lllyasviel/Annotators").to("cuda")
+        if args.controlnet == "openpose":
+            controlnet_aux_models["openpose"] = OpenposeDetector.from_pretrained("lllyasviel/Annotators").to("cuda")
 
-    return pipe, stream, depth_estimator
+    return pipe, stream, controlnet_aux_models
 
 def refit_lora_to_trt(stream, args, lora_name):
+    if args.controlnet != "none":
+        log(f"[WARNING] LoRA hot-swapping is currently not supported when using Fused ControlNet ({args.controlnet}). Ignoring LoRA {lora_name}.")
+        return
+
     import gc
     from diffusers import StableDiffusionPipeline
     from streamdiffusion.acceleration.tensorrt.models import UNet
@@ -875,7 +951,7 @@ def main():
         log("[FATAL] No CUDA device found. This engine needs an NVIDIA GPU.")
         sys.exit(1)
 
-    pipe, stream, depth_estimator = load_model_and_engine(args, args.lora)
+    pipe, stream, controlnet_aux_models = load_model_and_engine(args, args.lora)
     
     if args.lora and args.lora.lower() != "none":
         refit_lora_to_trt(stream, args, args.lora)
@@ -912,11 +988,7 @@ def main():
         delta=args.delta,
     )
 
-    # 1.0 means "never skip"; anything lower freezes the output while you sit
-    # still. The slider had been wired up but the call was commented out.
-    if args.freeze_threshold < 0.999:
-        stream.enable_similar_image_filter(threshold=args.freeze_threshold, max_skip_frame=10)
-        log(f"[Engine] Similar-image filter on at {args.freeze_threshold}")
+
 
     cam_id = int(args.camera) if str(args.camera).isdigit() else args.camera
     cap = ThreadedCamera(cam_id, mock=args.mock_camera)
@@ -948,7 +1020,7 @@ def main():
         except Exception as e:
             log(f"[Engine] Audio lip-sync unavailable ({e}).")
 
-    cam_t = threading.Thread(target=camera_thread, args=(cap, args, state_dict),
+    cam_t = threading.Thread(target=camera_thread, args=(cap, args, state_dict, controlnet_aux_models),
                              name="camera", daemon=True)
     post_t = threading.Thread(target=postprocess_thread, args=(args, zmq_socket, vcam, state_dict),
                               name="postprocess", daemon=True)
@@ -966,15 +1038,16 @@ def main():
     
     current_emotions = []
     embed_shape_warned = False
+    prev_frame_rgb = None
+    out_np = None
 
     try:
         while not STOP.is_set():
             if "freeze_threshold_dirty" in state_dict:
                 val = state_dict.pop("freeze_threshold_dirty")
-                if hasattr(stream, "similar_filter") and stream.similar_filter is not None:
-                    stream.similar_filter.set_threshold(val)
-                elif val < 0.999:
-                    stream.enable_similar_image_filter(threshold=val, max_skip_frame=10)
+                # We do NOT use StreamDiffusion's similar_image_filter because its
+                # cosine similarity metric conflicts with our structural MSE metric,
+                # causing 1-FPS ghosting. We handle freezing entirely via is_frozen!
             
             if "guidance_scale" in state_dict:
                 val = state_dict.pop("guidance_scale")
@@ -997,24 +1070,36 @@ def main():
                     state_dict["prompt_dirty"] = True
 
             t_wait = time.perf_counter()
-            try:
-                frame_rgb, soft_mask, original_frame_rgb, emotions = Q_IN.get(timeout=1.0)
-                starved = 0
-            except queue.Empty:
-                # A silent hang used to look identical to a slow first frame.
-                starved += 1
-                if starved in (5, 15):
-                    log(f"[Engine] No frames from the camera thread for {starved}s "
-                        f"(camera_alive={cap.thread.is_alive() if cap.thread else False}, "
-                        f"producer_alive={cam_t.is_alive()}).")
-                if starved >= 30:
-                    # A stolen or unplugged webcam used to hang here forever at
-                    # 0 FPS with the GUI frozen on the last frame.
-                    log("[FATAL] No camera frames for 30s — the device was most "
-                        "likely unplugged or taken by another application.")
-                    FAILED.set()
-                    STOP.set()
-                continue
+            
+            manual_freeze = state_dict.get("manual_freeze", False)
+            if manual_freeze and 'frame_rgb' in locals():
+                # If manually frozen, skip reading from webcam queue and reuse the last frame!
+                # We also must clear Q_IN so the camera thread doesn't fill it with stale frames.
+                try:
+                    while True:
+                        Q_IN.get_nowait()
+                except queue.Empty:
+                    pass
+            else:
+                try:
+                    item = Q_IN.get(timeout=1.0)
+                    frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final = item
+                    starved = 0
+                except queue.Empty:
+                    # A silent hang used to look identical to a slow first frame.
+                    starved += 1
+                    if starved in (5, 15):
+                        log(f"[Engine] No frames from the camera thread for {starved}s "
+                            f"(camera_alive={cap.thread.is_alive() if cap.thread else False}, "
+                            f"producer_alive={cam_t.is_alive()}).")
+                    if starved >= 30:
+                        # A stolen or unplugged webcam used to hang here forever at
+                        # 0 FPS with the GUI frozen on the last frame.
+                        log("[FATAL] No camera frames for 30s - the device was most "
+                            "likely unplugged or taken by another application.")
+                        FAILED.set()
+                        STOP.set()
+                    continue
 
             if audio_tracker is not None:
                 audio_sens = state_dict.get("sens_overrides", {}).get("audio", 1.5)
@@ -1039,7 +1124,7 @@ def main():
                 emotion_str = ", ".join(mapped) if mapped else ""
                 full_prompt = state_dict["base_prompt"] + (f", {emotion_str}" if emotion_str else "")
                 
-                # We must encode BOTH positive and negative prompts for cfg_type="full",
+                # We must encode BOTH positive and negative prompts for cfg_type=args.cfg_type,
                 # and use .copy_() to overwrite the existing tensor in-place.
                 # Wrap in torch.no_grad() to prevent massive VRAM leak when emotions change rapidly!
                 with torch.no_grad():
@@ -1076,21 +1161,46 @@ def main():
                 # was stalling the loop several times a second.
 
             t_got = time.perf_counter()
-            # Duplicate the single webcam frame to fill the required TensorRT batch size
-            input_imgs = [Image.fromarray(frame_rgb)] * args.frame_buffer
-            if args.frame_buffer == 1:
-                input_imgs = input_imgs[0]
+
+            # Dynamic Stillness Enhancement
+            is_frozen = False
+            if hasattr(stream, "similar_filter") and stream.similar_filter is not None:
+                stream.similar_filter.set_threshold(-1.0)
                 
+            similarity = 0.0
+            if prev_frame_rgb is not None:
+                # Calculate structural similarity. 1.0 = identical, drops towards 0.0 when moving.
+                # Compute on the raw webcam frame (original_frame_rgb) to avoid black-background bias in composite mode.
+                similarity = 1.0 / (1.0 + (np.mean((original_frame_rgb.astype(np.float32) - prev_frame_rgb.astype(np.float32)) ** 2) / 255.0))
+            prev_frame_rgb = original_frame_rgb.copy()
+            
+            freeze_threshold = state_dict.get("freeze_threshold_dirty", args.freeze_threshold)
+            if similarity > freeze_threshold and out_np is not None:
+                is_frozen = True
+                
+            if state_dict.get("manual_freeze", False) and out_np is not None:
+                is_frozen = True
+                
+            if is_frozen:
+                stream.guidance_scale = min(args.guidance_scale * 1.5, 4.0)
+                refinement_frame = cv2.addWeighted(out_np, 0.7, frame_rgb, 0.3, 0)
+                # Skip PIL conversion and go straight to GPU Tensor
+                x_in = torch.from_numpy(refinement_frame).permute(2, 0, 1).unsqueeze(0).to("cuda", dtype=torch.float16) / 255.0
+            else:
+                stream.guidance_scale = args.guidance_scale
+                # Skip PIL conversion and go straight to GPU Tensor
+                x_in = torch.from_numpy(frame_rgb).permute(2, 0, 1).unsqueeze(0).to("cuda", dtype=torch.float16) / 255.0
+            
+            if args.frame_buffer > 1:
+                input_imgs = x_in.repeat(args.frame_buffer, 1, 1, 1)
+            else:
+                input_imgs = x_in
+
             kwargs = {}
-            if depth_estimator is not None:
-                import torchvision.transforms.functional as TF
-                # Run MiDaS detector
-                depth_pil = depth_estimator(Image.fromarray(frame_rgb))
-                # Convert to Tensor [B, 3, H, W] scaled to [0, 1]
-                depth_tensor = TF.to_tensor(depth_pil).unsqueeze(0).to(dtype=torch.float16, device="cuda")
+            if cond_final is not None:
                 if args.frame_buffer > 1:
-                    depth_tensor = depth_tensor.repeat(args.frame_buffer, 1, 1, 1)
-                kwargs["controlnet_cond"] = depth_tensor
+                    cond_final = cond_final.repeat(args.frame_buffer, 1, 1, 1)
+                kwargs["controlnet_cond"] = cond_final
 
             output_image = stream(input_imgs, **kwargs)
             
@@ -1130,36 +1240,21 @@ def main():
                     stat_n, stat_wait, stat_infer = 0, 0.0, 0.0
                     stat_start = time.time()
 
-            if isinstance(output_image, (list, tuple)):
-                output_image = output_image[0] if output_image else None
-
-            # The similar-image filter returns prev_image_result, which is None
-            # on the very first skipped frame — previously this raised
-            # UnboundLocalError on out_frame and killed the engine.
             if output_image is None:
                 continue
 
             if isinstance(output_image, np.ndarray):
                 out_np = output_image
+                if out_np.dtype != np.uint8:
+                    out_np = (np.clip(out_np, 0.0, 1.0) * 255).astype(np.uint8)
+                out_frame = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
             else:
-                out_np = postprocess_image(output_image, output_type="np")[0]
-
-            if out_np.dtype != np.uint8:
-                # NaN/inf survives np.clip and casts to garbage bytes, which is
-                # what "the AI output is glitching" actually looks like.
-                if not np.isfinite(out_np).all():
-                    nan_frames += 1
-                    if nan_frames in (1, 10, 100, 1000):
-                        finite = np.isfinite(out_np)
-                        log(f"[Engine] WARNING: non-finite pixels from the model "
-                            f"({(~finite).sum()}/{out_np.size} on frame #{nan_frames}). "
-                            f"finite range [{out_np[finite].min() if finite.any() else float('nan'):.3f}, "
-                            f"{out_np[finite].max() if finite.any() else float('nan'):.3f}]. "
-                            f"This is an fp16 overflow in the UNet — try lowering CFG, "
-                            f"or set --cfg_type none to rule out RCFG.")
-                    out_np = np.nan_to_num(out_np, nan=0.0, posinf=1.0, neginf=0.0)
-                out_np = (np.clip(out_np, 0.0, 1.0) * 255).astype(np.uint8)
-            out_frame = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+                # Fast GPU to CPU conversion, taking the newest frame
+                out_t = output_image[-1] if len(output_image.shape) == 4 else output_image
+                out_t = (out_t / 2 + 0.5).clamp(0, 1) # denormalize
+                out_t = (out_t * 255).byte().permute(1, 2, 0)
+                out_np = out_t.cpu().numpy()
+                out_frame = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
 
             if Q_OUT.full():
                 try:
@@ -1167,7 +1262,7 @@ def main():
                 except queue.Empty:
                     pass
             try:
-                Q_OUT.put((out_frame, soft_mask, original_frame_rgb), timeout=1.0)
+                Q_OUT.put((out_frame, soft_mask, original_frame_rgb, cond_final, is_frozen), timeout=1.0)
             except queue.Full:
                 pass
     except KeyboardInterrupt:

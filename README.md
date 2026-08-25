@@ -26,7 +26,8 @@ python run_checks.py                      # Verify syntax and API arguments
 ``
 
 First-time setup on a fresh machine is setup.ps1 — it creates the venv, installs torch and the NVIDIA TensorRT wheel, clones and installs StreamDiffusion, and pins 
-umpy<2. equirements-lock.txt records the exact verified versions and why each one matters.
+umpy<2. 
+equirements-lock.txt records the exact verified versions and why each one matters.
 
 Everything writes to logs/ — ngine-latest.log (with an environment block and full tracebacks) and launcher-latest.log.
 
@@ -51,14 +52,15 @@ For the text prompt, the engine re-encodes the CLIP embeddings in-place and copi
 
 ## Controls
 
-| Control | What it actually does |
+| Control / Hotkey | What it actually does |
 | --- | --- |
-| **AI Strength** | --t_index (0 → step 45, 100 → step 12). The single most important dial. A high 	_index starts denoising from an almost clean latent, so the output looks like the raw webcam with a light filter. If the avatar "isn't applying", raise this. |
+| **AI Strength** | --t_index (0 step 45, 100 step 12). A high index starts denoising from an almost clean latent, so the output looks like the raw webcam. If the avatar "isn't applying", raise this. *(Requires engine restart).* |
 | **CFG** | --guidance_scale. Adjusts how strictly the AI adheres to the prompt. |
-| **Freeze Filter** | Halts generation while you sit perfectly still (measured via structural cosine similarity) to save GPU power and increase visual quality. |
-| **Motion Blur** | Blends sequential frames together to create a smooth, cinematic 30 FPS video feed. |
-| **Trigger Sensitivities** | Real-time hysteresis thresholds controlling exactly how aggressively the MediaPipe and Audio-FFT algorithms trigger custom prompt injections. |
-| **Expression Overrides** | Replaces default expression prompt injections (e.g., turning "smiling" into "sinister grin") on the fly. |
+| **Freeze Filter** | Halts generation while you sit perfectly still (measured via structural similarity) to increase visual quality. Shows [ AI FROZEN ] in the UI when active. |
+| **Manual Freeze (F8)** | Completely pauses the webcam feed and locks the AI onto the current frame. Great for tweaking prompts without worrying about moving. Shows ⏸ Unfreeze (F8) in the UI. |
+| **Randomize Style (Ctrl+R)**| Injects a randomly selected art style into your Master Prompt and immediately applies it. |
+| **Take Snapshot (F12)** | Captures a high-resolution snapshot of the current AI output, webcam frame, and ControlNet condition mask. Saved to snapshots/. |
+| **Save Replay (Ctrl+S)** | Dumps the last 5 seconds of the video buffer into an animated .webp file for instant sharing. |
 
 ## Engine Cache
 
@@ -75,7 +77,8 @@ TensorRT engines are cached centrally in `engines_tinyvae_base_...`. The first b
 ## Directory
 
 - launcher.py — CustomTkinter GUI, spawns and supervises the engine.
-- ealtime_video.py — The core headless TensorRT inference engine.
+- 
+ealtime_video.py — The core headless TensorRT inference engine.
 - udio_sync.py — Mic-driven FFT volume processing.
 - smoke_test.py — Runs the engine against a synthetic camera.
 - loras/ — Drop .safetensors character models here.
