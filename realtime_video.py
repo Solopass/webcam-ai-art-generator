@@ -140,6 +140,7 @@ def install_signal_handlers():
 # ---------------------------------------------------------------- camera ----
 class ThreadedCamera:
     def __init__(self, src=0, mock=False):
+        self.src = src
         self.capture = None
         self.is_mock = False
         self.is_screen = False
@@ -235,8 +236,12 @@ class ThreadedCamera:
                     self.frame_counter += 1
                     self.new_frame_event.set()
                 else:
-                    # Do not spin the CPU at 100% on a disconnected device.
-                    time.sleep(0.01)
+                    # If this is a video file, loop it seamlessly for preview!
+                    if isinstance(self.src, str) and os.path.isfile(self.src):
+                        self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    else:
+                        # Do not spin the CPU at 100% on a disconnected device.
+                        time.sleep(0.01)
 
     def read(self, wait=True, timeout=2.0):
         if wait:
@@ -466,7 +471,7 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
             except queue.Empty:
                 pass
         try:
-            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final))
+            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final, frame, (current_x, current_y, size)))
         except queue.Full:
             pass
 
@@ -502,7 +507,11 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                 break
             
             is_frozen = False
-            if len(item) == 5:
+            full_frame = None
+            crop_coords = None
+            if len(item) == 7:
+                raw_out_frame, soft_mask, original_frame_rgb, cond_final, is_frozen, full_frame, crop_coords = item
+            elif len(item) == 5:
                 raw_out_frame, soft_mask, original_frame_rgb, cond_final, is_frozen = item
             elif len(item) == 4:
                 raw_out_frame, soft_mask, original_frame_rgb, cond_final = item
@@ -569,6 +578,50 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
         alpha = state_dict.get("motion_smoothing", args.motion_smoothing)
         current_smoothed_frame = cv2.addWeighted(target_frame, 1.0 - alpha, current_smoothed_frame, alpha, 0)
         display_frame = current_smoothed_frame.astype(np.uint8)
+
+        vfx_blend_mode = state_dict.get("vfx_blend_mode", "Normal")
+        vfx_opacity = state_dict.get("vfx_opacity", 1.0)
+        
+        # HD VFX Compositing
+        if full_frame is not None and crop_coords is not None:
+            cx, cy, csize = crop_coords
+            # Protect bounds
+            fh, fw = full_frame.shape[:2]
+            cx = max(0, min(cx, fw - 1))
+            cy = max(0, min(cy, fh - 1))
+            csize = min(csize, fw - cx, fh - cy)
+            
+            if csize > 0:
+                ai_resized = cv2.resize(display_frame, (csize, csize))
+                
+                hd_region = full_frame[cy:cy+csize, cx:cx+csize].copy()
+                
+                mask_resized = None
+                if soft_mask is not None:
+                    mask_resized = cv2.resize(soft_mask, (csize, csize))[..., np.newaxis]
+                
+                base_region = hd_region.astype(np.float32)
+                ai_region = ai_resized.astype(np.float32)
+                
+                if vfx_blend_mode == "Screen":
+                    blended = 255.0 - ((255.0 - base_region) * (255.0 - ai_region) / 255.0)
+                elif vfx_blend_mode == "Color Dodge":
+                    blended = np.clip(base_region / (1.0001 - ai_region/255.0), 0, 255)
+                elif vfx_blend_mode == "Overlay":
+                    mask = base_region < 128
+                    blended = np.empty_like(base_region)
+                    blended[mask] = 2.0 * base_region[mask] * ai_region[mask] / 255.0
+                    blended[~mask] = 255.0 - 2.0 * (255.0 - base_region[~mask]) * (255.0 - ai_region[~mask]) / 255.0
+                else:
+                    blended = ai_region
+                
+                final_ai = (blended * vfx_opacity) + (base_region * (1.0 - vfx_opacity))
+                
+                if mask_resized is not None:
+                    final_ai = (final_ai * mask_resized) + (base_region * (1.0 - mask_resized))
+                    
+                full_frame[cy:cy+csize, cx:cx+csize] = final_ai.astype(np.uint8)
+                display_frame = full_frame
 
         # One transient send failure used to disable the virtual camera for the
         # rest of the session — OBS briefly grabbing the device during startup
@@ -1083,7 +1136,7 @@ def main():
             else:
                 try:
                     item = Q_IN.get(timeout=1.0)
-                    frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final = item
+                    frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final, full_frame, crop_coords = item
                     starved = 0
                 except queue.Empty:
                     # A silent hang used to look identical to a slow first frame.
@@ -1262,7 +1315,7 @@ def main():
                 except queue.Empty:
                     pass
             try:
-                Q_OUT.put((out_frame, soft_mask, original_frame_rgb, cond_final, is_frozen), timeout=1.0)
+                Q_OUT.put((out_frame, soft_mask, original_frame_rgb, cond_final, is_frozen, full_frame, crop_coords), timeout=1.0)
             except queue.Full:
                 pass
     except KeyboardInterrupt:

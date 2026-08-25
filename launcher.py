@@ -158,6 +158,7 @@ class VTuberStudioApp(ctk.CTk):
         self.tab_settings = self.tabview.add("Settings")
         self.tab_advanced = self.tabview.add("Advanced")
         self.tab_system = self.tabview.add("System")
+        self.tab_vfx = self.tabview.add("VFX Pipeline")
         
         self.right_col = ctk.CTkScrollableFrame(self.tab_settings)
         self.right_col.pack(fill=ctk.BOTH, expand=True)
@@ -462,6 +463,8 @@ class VTuberStudioApp(ctk.CTk):
                          on_change=_send_zoom,
                          desc="Zooms the camera in to focus tighter on your face.")
 
+
+
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         self.clahe_cb = ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
                                       variable=self.clahe_var)
@@ -558,6 +561,56 @@ class VTuberStudioApp(ctk.CTk):
                                       hover_color="#c82333", state="disabled",
                                       command=self.stop_script)
         self.stop_btn.pack(fill=ctk.X, padx=10, pady=(0, 10))
+
+
+
+
+        # --- VFX TAB ---
+        self.vfx_scroll = ctk.CTkScrollableFrame(self.tab_vfx)
+        self.vfx_scroll.pack(fill=ctk.BOTH, expand=True, padx=10, pady=10)
+        
+        ctk.CTkLabel(self.vfx_scroll, text="Offline Post-Production VFX", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(0,10))
+        ctk.CTkLabel(self.vfx_scroll, text="Fine-tune your VFX settings over a loaded .mp4 video, and then render the final perfectly composited video.", wraplength=350, justify="left").pack(pady=(0,20))
+        
+        def _send_vfx_op(v):
+            if getattr(self, "cmd_socket", None):
+                try: self.cmd_socket.send_string(__import__("json").dumps({"vfx_opacity": float(v)}))
+                except Exception: pass
+                
+        self.vfx_op_var = ctk.DoubleVar(value=self.settings.get("vfx_opacity", 1.0))
+        ctk.CTkLabel(self.vfx_scroll, text="VFX Opacity (Live Preview):", anchor="w").pack(anchor="w")
+        vfx_slider = ctk.CTkSlider(self.vfx_scroll, variable=self.vfx_op_var, from_=0.0, to=1.0, number_of_steps=20, command=_send_vfx_op)
+        vfx_slider.pack(fill=ctk.X, pady=(0,15))
+        
+        self.vfx_blend_var = ctk.StringVar(value=self.settings.get("vfx_blend_mode", "Normal"))
+        def _send_vfx_blend(v):
+            if getattr(self, "cmd_socket", None):
+                try: self.cmd_socket.send_string(__import__("json").dumps({"vfx_blend_mode": v}))
+                except Exception: pass
+                
+        ctk.CTkLabel(self.vfx_scroll, text="VFX Blend Mode:", anchor="w").pack(anchor="w")
+        self.vfx_blend_menu = ctk.CTkOptionMenu(self.vfx_scroll, values=["Normal", "Screen", "Color Dodge", "Overlay"], variable=self.vfx_blend_var, command=_send_vfx_blend)
+        self.vfx_blend_menu.pack(fill=ctk.X, pady=(0,30))
+        
+        def _export_vfx():
+            import subprocess
+            video_path = self.cam_entry.get().strip()
+            if not video_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
+                self.log("[Error] You must load a video file in the 'Settings' tab to export Offline VFX!")
+                return
+                
+            self.save_settings()
+            self.log(f"[Export] Starting Offline VFX Render for {video_path}...")
+            try:
+                subprocess.Popen([self.python_executable(), "process_video.py"])
+                self.log("[Export] process_video.py launched in the background. Check console for progress.")
+            except Exception as e:
+                self.log(f"[Export] Error launching: {e}")
+                
+        self.export_btn = ctk.CTkButton(self.vfx_scroll, text="🎞️ Export Offline VFX",
+                                        command=_export_vfx, height=40, font=ctk.CTkFont(size=14, weight="bold"),
+                                        fg_color="#f0ad4e", hover_color="#ec971f")
+        self.export_btn.pack(fill=ctk.X, pady=10)
 
         self.toggle_preview()
         self.update_video_frame()
@@ -667,7 +720,14 @@ class VTuberStudioApp(ctk.CTk):
                         avail = min(max(self.video_frame.winfo_width(), 64),
                                     max(self.video_frame.winfo_height(), 64))
                         side = max(256, min(avail - 8, 900))
-                        shown = cv2.resize(img_np, (side, side), interpolation=cv2.INTER_AREA)
+                        h_img, w_img = img_np.shape[:2]
+                        if h_img > w_img:
+                            new_h = side
+                            new_w = int(w_img * (side / h_img))
+                        else:
+                            new_w = side
+                            new_h = int(h_img * (side / w_img))
+                        shown = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
                         pil_img = Image.fromarray(cv2.cvtColor(shown, cv2.COLOR_BGR2RGB))
                         self.current_frame_image = ImageTk.PhotoImage(image=pil_img)
                         self.video_label.configure(image=self.current_frame_image, text="")
