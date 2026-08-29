@@ -4,15 +4,21 @@ __pycache__/
 *.pyo
 *.pyd
 logs/
-engines_tinyvae_fb*/
+snapshots/
+StreamDiffusion/
+
+# TensorRT build products. The old rule was engines_tinyvae_fb*/ which stopped
+# matching once the naming changed to engines_tinyvae_base_fb{N}_steps{M}/.
+engines_*/
 *.engine
 *.onnx
 *.safetensors
+trt_global_timing.cache
+
+# Per-machine session log; presets.json IS tracked on purpose so styles ship.
+history.json
+
 test_output.png
 *.mp4
 *.avi
 *.webm
-snapshots/
-StreamDiffusion/
-trt_global_timing.cache
-trt_global_timing.cache.lock

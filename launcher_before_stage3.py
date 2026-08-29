@@ -132,7 +132,6 @@ DEFAULTS = {
     "vfx_opacity": 1.0,
     "vfx_blend_mode": "Normal",
     "seed": 2,
-    "lora_strength": 1.0,
 }
 
 # AI Strength 0-100 maps onto the StreamDiffusion denoise start step.
@@ -167,12 +166,6 @@ class VTuberStudioApp(ctk.CTk):
         self.bind("<Control-space>", lambda e: self.take_snapshot())
         self.bind("<Control-f>", lambda e: self.toggle_freeze())
         self.bind("<F8>", lambda e: self.toggle_freeze())
-        self.bind("<F5>", lambda e: self.cycle_preset(-1))
-        self.bind("<F6>", lambda e: self.cycle_preset(+1))
-        # Hold Tab to see the untouched camera. Auto-repeat emits release/press
-        # pairs, so the release is debounced in _ab_release.
-        self.bind("<KeyPress-Tab>", self._ab_press)
-        self.bind("<KeyRelease-Tab>", self._ab_release)
 
         # Threading for non-blocking save
         self.saving = False
@@ -237,7 +230,6 @@ class VTuberStudioApp(ctk.CTk):
             "vfx_opacity": self.vfx_op_var.get(),
             "vfx_blend_mode": self.vfx_blend_var.get(),
             "seed": self.seed_var.get(),
-            "lora_strength": self.lora_strength_var.get(),
             "audio_sync": self.audio_var.get(),
             "keep_background": self.bg_keep_var.get(),
             "normalize_lighting": self.clahe_var.get(),
@@ -380,7 +372,6 @@ class VTuberStudioApp(ctk.CTk):
             "vfx_opacity": "vfx_op_var",
             "vfx_blend_mode": "vfx_blend_var",
             "seed": "seed_var",
-            "lora_strength": "lora_strength_var",
         }
         return getattr(self, mapping[key], None) if key in mapping else None
 
@@ -408,7 +399,6 @@ class VTuberStudioApp(ctk.CTk):
             {"stillness_blend": float(self.stillness_var.get())},
             {"vfx_opacity": float(self.vfx_op_var.get())},
             {"vfx_blend_mode": self.vfx_blend_var.get()},
-            {"lora_strength": float(self.lora_strength_var.get())},
         ):
             self.send_command(payload)
 
@@ -728,7 +718,7 @@ class VTuberStudioApp(ctk.CTk):
             fill=ctk.X, padx=8, pady=(6, 0))
         ctk.CTkLabel(preset_box,
                      text="★ presets only change style settings — your camera, "
-                          "OBS and preview options are left alone.  F5/F6 cycle presets · hold Tab for raw camera.",
+                          "OBS and preview options are left alone.",
                      font=ctk.CTkFont(size=11), text_color="gray",
                      justify="left", wraplength=340, anchor="w").pack(
             fill=ctk.X, padx=8, pady=(0, 4))
@@ -988,14 +978,6 @@ class VTuberStudioApp(ctk.CTk):
                          desc="While you hold still the engine re-feeds this much raw "
                               "webcam back into its own output. 0 disables it. Only "
                               "active when Freeze Filter is below 1.00.")
-
-        self.lora_strength_var = ctk.DoubleVar(value=self.settings.get("lora_strength", 1.0))
-        self._slider_row(12, "LoRA Strength", self.lora_strength_var, 0.0, 1.5, 15,
-                         fmt=lambda v: f"{v:.2f}",
-                         on_change=lambda v: self.send_command({"lora_strength": float(v)}),
-                         desc="How hard the character LoRA is applied. Takes effect on "
-                              "the next LoRA swap or START — it is baked in when the "
-                              "weights are fused, not applied per frame.")
 
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         self.clahe_cb = ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
@@ -1523,7 +1505,6 @@ class VTuberStudioApp(ctk.CTk):
             ({"mask_feather": int(self.feather_var.get())}, "Mask Feather:"),
             ({"temporal_denoise": float(self.denoise_var.get())}, "Temporal Denoise:"),
             ({"stillness_blend": float(self.stillness_var.get())}, "Stillness Blend:"),
-            ({"lora_strength": float(self.lora_strength_var.get())}, "LoRA Strength:"),
         ]
 
     def run_selftest(self):
@@ -1557,39 +1538,6 @@ class VTuberStudioApp(ctk.CTk):
             self.log("[Self-test] An unanswered command means the engine has no "
                      "handler for it — that control does nothing.")
         self._selftest_waiting = {}
-
-    def cycle_preset(self, step):
-        names = self.preset_names()
-        if not names:
-            return
-        try:
-            i = names.index(self.preset_var.get())
-        except ValueError:
-            i, step = 0, 0
-        self.preset_var.set(names[(i + step) % len(names)])
-        self.on_preset_load()
-
-    def _ab_press(self, _event=None):
-        # Tab normally moves focus; "break" keeps it as our shortcut.
-        if not getattr(self, "_ab_active", False):
-            self._ab_active = True
-            self.send_command({"ab_raw": True})
-        if getattr(self, "_ab_release_job", None):
-            self.after_cancel(self._ab_release_job)
-            self._ab_release_job = None
-        return "break"
-
-    def _ab_release(self, _event=None):
-        if getattr(self, "_ab_release_job", None):
-            self.after_cancel(self._ab_release_job)
-        self._ab_release_job = self.after(90, self._ab_end)
-        return "break"
-
-    def _ab_end(self):
-        self._ab_release_job = None
-        if getattr(self, "_ab_active", False):
-            self._ab_active = False
-            self.send_command({"ab_raw": False})
 
     def _end_lora_swap(self):
         if not getattr(self, "_lora_swap_pending", False):
@@ -1724,7 +1672,6 @@ class VTuberStudioApp(ctk.CTk):
             "--vfx_opacity", f"{self.vfx_op_var.get():.3f}",
             "--vfx_blend_mode", self.vfx_blend_var.get(),
             "--seed", str(int(self.seed_var.get())),
-            "--lora_strength", f"{self.lora_strength_var.get():.3f}",
         ]
         if self.no_segment_var.get():
             cmd.append("--no_segment")
@@ -1868,7 +1815,6 @@ class VTuberStudioApp(ctk.CTk):
         # after a crash mid-swap, and a stale manual_freeze inverts the button.
         self._end_lora_swap()
         self.manual_freeze = False
-        self._ab_active = False
         self._selftest_waiting = {}
         if getattr(self, "closing", False):
             return

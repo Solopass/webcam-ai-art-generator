@@ -712,18 +712,6 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                     log(f"[Engine] Virtual camera reconnect failed "
                         f"(attempt {vcam_failures}): {e}")
 
-        # A/B: show the untouched camera frame while the key is held.
-        if state_dict.get("ab_raw", False) and original_frame_rgb is not None:
-            display_frame = cv2.cvtColor(original_frame_rgb, cv2.COLOR_RGB2BGR)
-            if full_frame is not None and crop_coords is not None:
-                cx2, cy2, cw2, ch2 = crop_coords
-                fh2, fw2 = full_frame.shape[:2]
-                cx2, cy2 = max(0, min(cx2, fw2 - 1)), max(0, min(cy2, fh2 - 1))
-                cw2, ch2 = min(cw2, fw2 - cx2), min(ch2, fh2 - cy2)
-                if cw2 > 0 and ch2 > 0:
-                    full_frame[cy2:cy2 + ch2, cx2:cx2 + cw2] = cv2.resize(display_frame, (cw2, ch2))
-                    display_frame = full_frame
-
         if vcam is not None:
             hd = cv2.resize(display_frame, (1024, 1024), interpolation=cv2.INTER_LINEAR)
             try:
@@ -821,7 +809,6 @@ def build_args():
     # Was hardcoded to 2 inside StreamDiffusion.prepare(); exposing it makes a
     # given prompt + seed reproducible between runs.
     parser.add_argument("--seed", type=int, default=2)
-    parser.add_argument("--lora_strength", type=float, default=1.0)
     parser.add_argument("--no_segment", action="store_true",
                         help="Skip MediaPipe selfie segmentation entirely. Without "
                              "it the input is grey-screened before inference AND the "
@@ -945,13 +932,10 @@ def cmd_listener_thread(port, state_dict):
                                            ("brightness", "Brightness"),
                                            ("mask_feather", "Mask Feather"),
                                            ("temporal_denoise", "Temporal Denoise"),
-                                           ("stillness_blend", "Stillness Blend"),
-                                           ("lora_strength", "LoRA Strength")):
+                                           ("stillness_blend", "Stillness Blend")):
                             if _k in cmd:
                                 state_dict[_k] = cmd[_k]
                                 log(f"[Engine] {_label}: {cmd[_k]}")
-                        if "ab_raw" in cmd:
-                            state_dict["ab_raw"] = bool(cmd["ab_raw"])
                         if "lora" in cmd:
                             # Consumed by the main loop, which owns the TRT refit.
                             state_dict["lora"] = cmd["lora"]
@@ -1053,31 +1037,6 @@ def load_model_and_engine(args, lora_name):
         },
     )
 
-    # The user LoRA only ever reached the TensorRT UNet (via refit_lora_to_trt),
-    # so stream.pipe.text_encoder kept BASE weights forever and LoRA trigger
-    # tokens never conditioned anything. Fuse the text-encoder half here.
-    #
-    # Deliberately after acceleration: doing it before would bake the LoRA into
-    # a freshly built engine, and engine_dir is shared "base" across every LoRA.
-    # fuse_unet=False keeps the UNet untouched either way. Guarded, because the
-    # old pre-PEFT diffusers 0.24 backend is fussy — a failure here degrades to
-    # the previous behaviour rather than breaking a working engine.
-    if lora_name and str(lora_name).lower() != "none":
-        lora_path = os.path.join(SCRIPT_DIR, "loras", lora_name)
-        if os.path.exists(lora_path):
-            scale = float(getattr(args, "lora_strength", 1.0))
-            try:
-                pipe.load_lora_weights(lora_path)
-                pipe.fuse_lora(fuse_unet=False, fuse_text_encoder=True,
-                               lora_scale=scale)
-                log(f"[Engine] Fused '{lora_name}' into the TEXT ENCODER "
-                    f"(strength {scale:.2f}) — trigger tokens now condition.")
-            except Exception as e:
-                log(f"[Engine] Text-encoder LoRA fuse skipped ({e}). The UNet "
-                    f"refit still applies; only trigger words are weaker.")
-        else:
-            log(f"[Engine] LoRA not found for text-encoder fuse: {lora_path}")
-
     controlnet_aux_models = {}
     if args.controlnet != "none":
         from streamdiffusion.acceleration.tensorrt.engine import UNet2DConditionModelEngine
@@ -1107,8 +1066,7 @@ def load_model_and_engine(args, lora_name):
 
     return pipe, stream, controlnet_aux_models
 
-def refit_lora_to_trt(stream, args, lora_name, state=None):
-    state = state if state is not None else {"lora_strength": getattr(args, "lora_strength", 1.0)}
+def refit_lora_to_trt(stream, args, lora_name):
     if args.controlnet != "none":
         log(f"[WARNING] LoRA hot-swapping is currently not supported when using Fused ControlNet ({args.controlnet}). Ignoring LoRA {lora_name}.")
         return
@@ -1133,7 +1091,7 @@ def refit_lora_to_trt(stream, args, lora_name, state=None):
         if os.path.exists(lora_path):
             log(f"[Engine] Fusing {lora_name} into UNet...")
             pipe.load_lora_weights(lora_path)
-            pipe.fuse_lora(lora_scale=float(state.get("lora_strength", 1.0)))
+            pipe.fuse_lora()
     
     log("[Engine] Fusing LCM-LoRA...")
     pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
@@ -1214,7 +1172,6 @@ def main():
                   "stillness_blend": args.stillness_blend,
                   "vfx_opacity": args.vfx_opacity,
                   "vfx_blend_mode": args.vfx_blend_mode,
-                  "lora_strength": args.lora_strength,
                   "prompt_dirty": True}
 
     # Bind the command socket BEFORE the model load. It needs nothing from the
@@ -1234,7 +1191,7 @@ def main():
 
     current_lora = args.lora if (args.lora and args.lora.lower() != "none") else "None"
     if current_lora != "None":
-        refit_lora_to_trt(stream, args, args.lora, state_dict)
+        refit_lora_to_trt(stream, args, args.lora)
 
     log(f"[Engine] Preparing (t_index={args.t_index}, cfg={args.cfg_type}, "
         f"guidance={args.guidance_scale}, delta={args.delta})")
@@ -1482,7 +1439,7 @@ def main():
                 current_lora = new_lora
 
                 try:
-                    refit_lora_to_trt(stream, args, current_lora, state_dict)
+                    refit_lora_to_trt(stream, args, current_lora)
                 except Exception as e:
                     # A failed refit must not kill a working stream — the old
                     # weights are still resident, so carry on with them.

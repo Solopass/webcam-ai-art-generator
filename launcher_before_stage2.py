@@ -26,8 +26,7 @@ HISTORY_LIMIT = 50
 # Settings the engine reads once at launch. Everything else has a live handler
 # in cmd_listener_thread and can be pushed over ZMQ mid-run.
 RESTART_ONLY_KEYS = {
-    "camera", "perf_mode", "controlnet", "ai_strength", "cuda_graph", "seed",
-    "mirror_camera",
+    "camera", "perf_mode", "controlnet", "ai_strength", "cuda_graph",
     "virtual_camera", "audio_sync", "no_face_track", "normalize_lighting",
     "bg_image",
 }
@@ -129,10 +128,6 @@ DEFAULTS = {
     "mask_feather": 7.0,
     "temporal_denoise": 0.4,
     "stillness_blend": 0.3,
-    "vfx_opacity": 1.0,
-    "vfx_blend_mode": "Normal",
-    "seed": 2,
-    "lora_strength": 1.0,
 }
 
 # AI Strength 0-100 maps onto the StreamDiffusion denoise start step.
@@ -167,12 +162,6 @@ class VTuberStudioApp(ctk.CTk):
         self.bind("<Control-space>", lambda e: self.take_snapshot())
         self.bind("<Control-f>", lambda e: self.toggle_freeze())
         self.bind("<F8>", lambda e: self.toggle_freeze())
-        self.bind("<F5>", lambda e: self.cycle_preset(-1))
-        self.bind("<F6>", lambda e: self.cycle_preset(+1))
-        # Hold Tab to see the untouched camera. Auto-repeat emits release/press
-        # pairs, so the release is debounced in _ab_release.
-        self.bind("<KeyPress-Tab>", self._ab_press)
-        self.bind("<KeyRelease-Tab>", self._ab_release)
 
         # Threading for non-blocking save
         self.saving = False
@@ -232,12 +221,6 @@ class VTuberStudioApp(ctk.CTk):
             "mask_feather": self.feather_var.get(),
             "temporal_denoise": self.denoise_var.get(),
             "stillness_blend": self.stillness_var.get(),
-            # Were initialised from settings but never written back, so
-            # save_settings() deleted them from disk on every START.
-            "vfx_opacity": self.vfx_op_var.get(),
-            "vfx_blend_mode": self.vfx_blend_var.get(),
-            "seed": self.seed_var.get(),
-            "lora_strength": self.lora_strength_var.get(),
             "audio_sync": self.audio_var.get(),
             "keep_background": self.bg_keep_var.get(),
             "normalize_lighting": self.clahe_var.get(),
@@ -339,12 +322,6 @@ class VTuberStudioApp(ctk.CTk):
 
         if push_live and self.process is not None:
             self._push_live_settings()
-            # var.set() on a CTkOptionMenu updates the text without firing its
-            # command, so a preset/history load would show a new LoRA while the
-            # engine kept rendering the old one.
-            if "lora" in values:
-                lora = self.lora_var.get()
-                self.send_command({"lora": "None" if lora.startswith("None") else lora})
 
         return changed_restart_only
 
@@ -379,8 +356,6 @@ class VTuberStudioApp(ctk.CTk):
             "zoom": "zoom_var",
             "vfx_opacity": "vfx_op_var",
             "vfx_blend_mode": "vfx_blend_var",
-            "seed": "seed_var",
-            "lora_strength": "lora_strength_var",
         }
         return getattr(self, mapping[key], None) if key in mapping else None
 
@@ -406,9 +381,6 @@ class VTuberStudioApp(ctk.CTk):
             {"mask_feather": int(self.feather_var.get())},
             {"temporal_denoise": float(self.denoise_var.get())},
             {"stillness_blend": float(self.stillness_var.get())},
-            {"vfx_opacity": float(self.vfx_op_var.get())},
-            {"vfx_blend_mode": self.vfx_blend_var.get()},
-            {"lora_strength": float(self.lora_strength_var.get())},
         ):
             self.send_command(payload)
 
@@ -700,26 +672,6 @@ class VTuberStudioApp(ctk.CTk):
         ctk.CTkLabel(self.right_col, text="Studio Settings",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(pady=10)
 
-        # --- Live status: parsed from the engine's own FPS log lines, so
-        # there is no extra plumbing to keep in sync.
-        self.status_label = ctk.CTkLabel(
-            self.right_col, text="Engine stopped.", anchor="w",
-            font=ctk.CTkFont(size=12), text_color="#8ab4f8", justify="left")
-        self.status_label.pack(fill=ctk.X, padx=12, pady=(0, 6))
-
-        seed_box = ctk.CTkFrame(self.right_col, fg_color="transparent")
-        seed_box.pack(fill=ctk.X, padx=10, pady=(0, 4))
-        ctk.CTkLabel(seed_box, text="Seed:", anchor="w", width=44).pack(side=ctk.LEFT)
-        self.seed_var = ctk.IntVar(value=int(self.settings.get("seed", 2)))
-        self.seed_entry = ctk.CTkEntry(seed_box, textvariable=self.seed_var, width=80)
-        self.seed_entry.pack(side=ctk.LEFT, padx=(0, 6))
-        def _roll_seed():
-            import random
-            self.seed_var.set(random.randint(0, 2 ** 31 - 1))
-        ctk.CTkButton(seed_box, text="🎲", width=34, command=_roll_seed).pack(side=ctk.LEFT)
-        ctk.CTkLabel(seed_box, text="(applies on next START)",
-                     font=ctk.CTkFont(size=11), text_color="gray").pack(side=ctk.LEFT, padx=6)
-
         # --- Style presets ---
         preset_box = ctk.CTkFrame(self.right_col)
         preset_box.pack(fill=ctk.X, padx=10, pady=(0, 10))
@@ -728,7 +680,7 @@ class VTuberStudioApp(ctk.CTk):
             fill=ctk.X, padx=8, pady=(6, 0))
         ctk.CTkLabel(preset_box,
                      text="★ presets only change style settings — your camera, "
-                          "OBS and preview options are left alone.  F5/F6 cycle presets · hold Tab for raw camera.",
+                          "OBS and preview options are left alone.",
                      font=ctk.CTkFont(size=11), text_color="gray",
                      justify="left", wraplength=340, anchor="w").pack(
             fill=ctk.X, padx=8, pady=(0, 4))
@@ -768,15 +720,7 @@ class VTuberStudioApp(ctk.CTk):
             if val == "None (Original Default)":
                 val = "None"
             if self.process is None:
-                self._last_sent_lora = val
                 return
-            # CTkOptionMenu fires its command even when you re-pick the value
-            # that is already selected. The engine ignores a no-op swap, so no
-            # completion line ever came back and the dropdown stayed greyed out
-            # for the full 120s fallback.
-            if val == getattr(self, "_last_sent_lora", None):
-                return
-            self._last_sent_lora = val
             # The refit re-fuses the UNet, re-exports ONNX and reloads TRT
             # weights on the inference thread — 30-60s with the output frozen.
             # Grey the dropdown so that reads as "busy", not "broken".
@@ -862,7 +806,7 @@ class VTuberStudioApp(ctk.CTk):
 
         self.bg_keep_var = ctk.BooleanVar(value=self.settings.get("keep_background", False))
         self.bg_keep_cb = ctk.CTkSwitch(self.right_col, text="Composite Real Background",
-                                        command=lambda: self.send_command({"composite": self.bg_keep_var.get()}), variable=self.bg_keep_var)
+                                        command=lambda: self.cmd_socket.send_string(__import__("json").dumps({"composite": self.bg_keep_var.get()})) if getattr(self, "cmd_socket", None) else None, variable=self.bg_keep_var)
         self.bg_keep_cb.pack(anchor="w", padx=15, pady=4)
 
         # Background image
@@ -896,7 +840,7 @@ class VTuberStudioApp(ctk.CTk):
         # tensor and changes the UNet batch out from under the built engine.
         self.guidance_var = ctk.DoubleVar(value=max(1.05, self.settings.get("guidance", 1.4)))
         self._slider_row(1, "Prompt Strictness (CFG)", self.guidance_var, 1.05, 3.0, 20, fmt=lambda v: f"{v:.2f}",
-                         on_change=lambda v: self.send_command({"guidance_scale": float(v)}),
+                         on_change=lambda v: self.cmd_socket.send_string(__import__("json").dumps({"guidance_scale": float(v)})) if getattr(self, "cmd_socket", None) else None,
                          desc="How strictly the AI follows your text prompt. High values may look deep-fried.")
 
         import json
@@ -989,14 +933,6 @@ class VTuberStudioApp(ctk.CTk):
                               "webcam back into its own output. 0 disables it. Only "
                               "active when Freeze Filter is below 1.00.")
 
-        self.lora_strength_var = ctk.DoubleVar(value=self.settings.get("lora_strength", 1.0))
-        self._slider_row(12, "LoRA Strength", self.lora_strength_var, 0.0, 1.5, 15,
-                         fmt=lambda v: f"{v:.2f}",
-                         on_change=lambda v: self.send_command({"lora_strength": float(v)}),
-                         desc="How hard the character LoRA is applied. Takes effect on "
-                              "the next LoRA swap or START — it is baked in when the "
-                              "weights are fused, not applied per frame.")
-
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         self.clahe_cb = ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
                                       variable=self.clahe_var)
@@ -1023,7 +959,7 @@ class VTuberStudioApp(ctk.CTk):
             entry.grid(row=i*2+1, column=0, sticky="ew")
             # Bind live update over ZMQ
             def make_cb(e, v):
-                return lambda *args: self.send_command({"expr_override": {e: v.get()}})
+                return lambda *args: self.cmd_socket.send_string(json.dumps({"expr_override": {e: v.get()}})) if getattr(self, "cmd_socket", None) else None
             var.trace_add("write", make_cb(expr, var))
 
         # Sensitivities
@@ -1043,7 +979,7 @@ class VTuberStudioApp(ctk.CTk):
             self.sens_vars[key] = var
             
             def make_sens_cb(k, v):
-                return lambda val: self.send_command({"sens_override": {k: float(val)}})
+                return lambda val: self.cmd_socket.send_string(json.dumps({"sens_override": {k: float(val)}})) if getattr(self, "cmd_socket", None) else None
                 
             slider = ctk.CTkSlider(self.sens_frame, variable=var, from_=limits[key][0], to=limits[key][1], width=140, command=make_sens_cb(key, var))
             slider.grid(row=i, column=1, sticky="ew", padx=(10, 0), pady=2)
@@ -1334,36 +1270,10 @@ class VTuberStudioApp(ctk.CTk):
 
         self.after(15, self.update_video_frame)
 
-    # Terms that mean the same thing on both sides of the prompt. If a style
-    # asks for one, it must not also be in the negative.
-    _CONFLICT_TERMS = ("3d", "render", "realistic", "photo", "photorealistic",
-                       "octane", "blender", "unreal engine", "depth of field",
-                       "film grain", "sketch", "pixel art", "oil painting")
-
-    def _reconcile_negative(self, prompt, negative):
-        """Drop negative terms the positive prompt is explicitly asking for.
-
-        Ctrl+R rolling "pixar 3D animation style ... unreal engine" while the
-        loaded preset's negative still said "3d, render, realistic" had the two
-        halves cancelling each other out.
-        """
-        low = prompt.lower()
-        kept, dropped = [], []
-        for term in [t.strip() for t in negative.split(",") if t.strip()]:
-            if term.lower() in self._CONFLICT_TERMS and term.lower() in low:
-                dropped.append(term)
-            else:
-                kept.append(term)
-        return ", ".join(kept), dropped
-
     def apply_prompt(self, quiet=False):
         """Push whatever is in the two text boxes to the running engine."""
         prompt = self.prompt_entry.get().strip()
         negative = self.neg_prompt_entry.get().strip()
-        negative, dropped = self._reconcile_negative(prompt, negative)
-        if dropped and not quiet:
-            self.log(f"[Prompt] Your style asks for {', '.join(dropped)} — dropped "
-                     f"from the negative prompt for this send so they don't cancel out.")
         if getattr(self, "easyneg_var", None) and self.easyneg_var.get():
             negative = negative + ", EasyNegative" if negative else "EasyNegative"
         if not prompt:
@@ -1523,7 +1433,6 @@ class VTuberStudioApp(ctk.CTk):
             ({"mask_feather": int(self.feather_var.get())}, "Mask Feather:"),
             ({"temporal_denoise": float(self.denoise_var.get())}, "Temporal Denoise:"),
             ({"stillness_blend": float(self.stillness_var.get())}, "Stillness Blend:"),
-            ({"lora_strength": float(self.lora_strength_var.get())}, "LoRA Strength:"),
         ]
 
     def run_selftest(self):
@@ -1558,39 +1467,6 @@ class VTuberStudioApp(ctk.CTk):
                      "handler for it — that control does nothing.")
         self._selftest_waiting = {}
 
-    def cycle_preset(self, step):
-        names = self.preset_names()
-        if not names:
-            return
-        try:
-            i = names.index(self.preset_var.get())
-        except ValueError:
-            i, step = 0, 0
-        self.preset_var.set(names[(i + step) % len(names)])
-        self.on_preset_load()
-
-    def _ab_press(self, _event=None):
-        # Tab normally moves focus; "break" keeps it as our shortcut.
-        if not getattr(self, "_ab_active", False):
-            self._ab_active = True
-            self.send_command({"ab_raw": True})
-        if getattr(self, "_ab_release_job", None):
-            self.after_cancel(self._ab_release_job)
-            self._ab_release_job = None
-        return "break"
-
-    def _ab_release(self, _event=None):
-        if getattr(self, "_ab_release_job", None):
-            self.after_cancel(self._ab_release_job)
-        self._ab_release_job = self.after(90, self._ab_end)
-        return "break"
-
-    def _ab_end(self):
-        self._ab_release_job = None
-        if getattr(self, "_ab_active", False):
-            self._ab_active = False
-            self.send_command({"ab_raw": False})
-
     def _end_lora_swap(self):
         if not getattr(self, "_lora_swap_pending", False):
             return
@@ -1616,16 +1492,6 @@ class VTuberStudioApp(ctk.CTk):
                 self.log_file.write(message + "\n")
             except Exception:
                 pass
-
-        # "[Engine] 10.0 FPS | wait 28.6ms  infer 69.4ms | 3 NaN frames"
-        if " FPS | wait " in message:
-            try:
-                stat = message.split("[Engine]", 1)[-1].strip()
-                self.status_label.configure(text="▶ " + stat)
-            except Exception:
-                pass
-        elif "READY" in message:
-            self.status_label.configure(text="▶ running — waiting for first stats...")
 
         waiting = getattr(self, "_selftest_waiting", None)
         if waiting:
@@ -1721,10 +1587,6 @@ class VTuberStudioApp(ctk.CTk):
             "--mask_feather", str(int(self.feather_var.get())),
             "--temporal_denoise", f"{self.denoise_var.get():.3f}",
             "--stillness_blend", f"{self.stillness_var.get():.3f}",
-            "--vfx_opacity", f"{self.vfx_op_var.get():.3f}",
-            "--vfx_blend_mode", self.vfx_blend_var.get(),
-            "--seed", str(int(self.seed_var.get())),
-            "--lora_strength", f"{self.lora_strength_var.get():.3f}",
         ]
         if self.no_segment_var.get():
             cmd.append("--no_segment")
@@ -1864,19 +1726,12 @@ class VTuberStudioApp(ctk.CTk):
             except Exception:
                 pass
             self.cmd_socket = None
-        # These outlive the process otherwise: the dropdown stays greyed out
-        # after a crash mid-swap, and a stale manual_freeze inverts the button.
-        self._end_lora_swap()
-        self.manual_freeze = False
-        self._ab_active = False
-        self._selftest_waiting = {}
         if getattr(self, "closing", False):
             return
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self._set_ui_state("normal")
         self.video_label.configure(image="", text="Engine stopped.")
-        self.status_label.configure(text="Engine stopped.")
         self.current_frame_image = None
         self.process = None
 

@@ -1,0 +1,380 @@
+From ca95928019ea50b7dea3f072ef5e414add9c63f9 Mon Sep 17 00:00:00 2001
+From: Jake Cohen <realsolopass@gmail.com>
+Date: Mon, 24 Aug 2026 19:17:29 -0400
+Subject: [PATCH] feat: Add native ControlNet conditioning support to
+ StreamDiffusion Pipeline and TRT wrapper
+
+---
+ .../acceleration/tensorrt/__init__.py         |  6 +++
+ .../acceleration/tensorrt/builder.py          |  2 +
+ .../acceleration/tensorrt/engine.py           | 31 +++++++++-----
+ .../acceleration/tensorrt/utilities.py        | 11 +++--
+ src/streamdiffusion/pipeline.py               | 40 +++++++++++++++----
+ utils/wrapper.py                              | 23 +++++++----
+ 6 files changed, 83 insertions(+), 30 deletions(-)
+
+diff --git a/src/streamdiffusion/acceleration/tensorrt/__init__.py b/src/streamdiffusion/acceleration/tensorrt/__init__.py
+index d622e02..a986f06 100644
+--- a/src/streamdiffusion/acceleration/tensorrt/__init__.py
++++ b/src/streamdiffusion/acceleration/tensorrt/__init__.py
+@@ -31,6 +31,7 @@ def compile_vae_encoder(
+     engine_path: str,
+     opt_batch_size: int = 1,
+     engine_build_options: dict = {},
++    **kwargs
+ ):
+     builder = EngineBuilder(model_data, vae, device=torch.device("cuda"))
+     builder.build(
+@@ -39,6 +40,7 @@ def compile_vae_encoder(
+         engine_path,
+         opt_batch_size=opt_batch_size,
+         **engine_build_options,
++        **kwargs
+     )
+ 
+ 
+@@ -50,6 +52,7 @@ def compile_vae_decoder(
+     engine_path: str,
+     opt_batch_size: int = 1,
+     engine_build_options: dict = {},
++    **kwargs
+ ):
+     vae = vae.to(torch.device("cuda"))
+     builder = EngineBuilder(model_data, vae, device=torch.device("cuda"))
+@@ -59,6 +62,7 @@ def compile_vae_decoder(
+         engine_path,
+         opt_batch_size=opt_batch_size,
+         **engine_build_options,
++        **kwargs
+     )
+ 
+ 
+@@ -70,6 +74,7 @@ def compile_unet(
+     engine_path: str,
+     opt_batch_size: int = 1,
+     engine_build_options: dict = {},
++    **kwargs
+ ):
+     unet = unet.to(torch.device("cuda"), dtype=torch.float16)
+     builder = EngineBuilder(model_data, unet, device=torch.device("cuda"))
+@@ -79,6 +84,7 @@ def compile_unet(
+         engine_path,
+         opt_batch_size=opt_batch_size,
+         **engine_build_options,
++        **kwargs
+     )
+ 
+ 
+diff --git a/src/streamdiffusion/acceleration/tensorrt/builder.py b/src/streamdiffusion/acceleration/tensorrt/builder.py
+index 69de1bc..9e9808e 100644
+--- a/src/streamdiffusion/acceleration/tensorrt/builder.py
++++ b/src/streamdiffusion/acceleration/tensorrt/builder.py
+@@ -46,6 +46,7 @@ class EngineBuilder:
+         force_engine_build: bool = False,
+         force_onnx_export: bool = False,
+         force_onnx_optimize: bool = False,
++        timing_cache: str = None,
+     ):
+         if not force_onnx_export and os.path.exists(onnx_path):
+             print(f"Found cached model: {onnx_path}")
+@@ -88,6 +89,7 @@ class EngineBuilder:
+                 build_dynamic_shape=build_dynamic_shape,
+                 build_all_tactics=build_all_tactics,
+                 build_enable_refit=build_enable_refit,
++                timing_cache=timing_cache,
+             )
+ 
+         gc.collect()
+diff --git a/src/streamdiffusion/acceleration/tensorrt/engine.py b/src/streamdiffusion/acceleration/tensorrt/engine.py
+index 43d6524..68ce2c2 100644
+--- a/src/streamdiffusion/acceleration/tensorrt/engine.py
++++ b/src/streamdiffusion/acceleration/tensorrt/engine.py
+@@ -28,22 +28,31 @@ class UNet2DConditionModelEngine:
+         if timestep.dtype != torch.float32:
+             timestep = timestep.float()
+ 
++        shape_dict = {
++            "sample": latent_model_input.shape,
++            "timestep": timestep.shape,
++            "encoder_hidden_states": encoder_hidden_states.shape,
++            "latent": latent_model_input.shape,
++        }
++        
++        infer_inputs = {
++            "sample": latent_model_input,
++            "timestep": timestep,
++            "encoder_hidden_states": encoder_hidden_states,
++        }
++
++        if "controlnet_cond" in kwargs and kwargs["controlnet_cond"] is not None:
++            cond = kwargs["controlnet_cond"]
++            shape_dict["controlnet_cond"] = cond.shape
++            infer_inputs["controlnet_cond"] = cond
++
+         self.engine.allocate_buffers(
+-            shape_dict={
+-                "sample": latent_model_input.shape,
+-                "timestep": timestep.shape,
+-                "encoder_hidden_states": encoder_hidden_states.shape,
+-                "latent": latent_model_input.shape,
+-            },
++            shape_dict=shape_dict,
+             device=latent_model_input.device,
+         )
+ 
+         noise_pred = self.engine.infer(
+-            {
+-                "sample": latent_model_input,
+-                "timestep": timestep,
+-                "encoder_hidden_states": encoder_hidden_states,
+-            },
++            infer_inputs,
+             self.stream,
+             use_cuda_graph=self.use_cuda_graph,
+         )["latent"]
+diff --git a/src/streamdiffusion/acceleration/tensorrt/utilities.py b/src/streamdiffusion/acceleration/tensorrt/utilities.py
+index eb1b01e..6924b29 100644
+--- a/src/streamdiffusion/acceleration/tensorrt/utilities.py
++++ b/src/streamdiffusion/acceleration/tensorrt/utilities.py
+@@ -44,7 +44,7 @@ from polygraphy.backend.trt import util as trt_util
+ from .models import CLIP, VAE, BaseModel, UNet, VAEEncoder
+ 
+ 
+-TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
++TRT_LOGGER = trt.Logger(trt.Logger.VERBOSE)
+ 
+ # Map of numpy dtype -> torch dtype
+ numpy_to_torch_dtype_dict = {
+@@ -222,8 +222,8 @@ class Engine:
+ 
+         if workspace_size > 0:
+             config_kwargs["memory_pool_limits"] = {trt.MemoryPoolType.WORKSPACE: workspace_size}
+-        if not enable_all_tactics:
+-            config_kwargs["tactic_sources"] = []
++        # if not enable_all_tactics:
++        #     config_kwargs["tactic_sources"] = []
+ 
+         engine = engine_from_network(
+             network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]),
+@@ -246,7 +246,8 @@ class Engine:
+             self.context = self.engine.create_execution_context()
+ 
+     def allocate_buffers(self, shape_dict=None, device="cuda"):
+-        for idx in range(trt_util.get_bindings_per_profile(self.engine)):
++        bindings_per_profile = self.engine.num_bindings // self.engine.num_optimization_profiles
++        for idx in range(bindings_per_profile):
+             binding = self.engine[idx]
+             if shape_dict and binding in shape_dict:
+                 shape = shape_dict[binding]
+@@ -374,6 +375,7 @@ def build_engine(
+     build_dynamic_shape: bool = False,
+     build_all_tactics: bool = False,
+     build_enable_refit: bool = False,
++    timing_cache: str = None,
+ ):
+     _, free_mem, _ = cudart.cudaMemGetInfo()
+     GiB = 2**30
+@@ -397,6 +399,7 @@ def build_engine(
+         enable_refit=build_enable_refit,
+         enable_all_tactics=build_all_tactics,
+         workspace_size=max_workspace_size,
++        timing_cache=timing_cache,
+     )
+ 
+     return engine
+diff --git a/src/streamdiffusion/pipeline.py b/src/streamdiffusion/pipeline.py
+index 66c08c8..1c430b1 100644
+--- a/src/streamdiffusion/pipeline.py
++++ b/src/streamdiffusion/pipeline.py
+@@ -300,21 +300,29 @@ class StreamDiffusion:
+         x_t_latent: torch.Tensor,
+         t_list: Union[torch.Tensor, list[int]],
+         idx: Optional[int] = None,
++        controlnet_cond: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
+             x_t_latent_plus_uc = torch.concat([x_t_latent[0:1], x_t_latent], dim=0)
+             t_list = torch.concat([t_list[0:1], t_list], dim=0)
++            if controlnet_cond is not None:
++                controlnet_cond = torch.concat([controlnet_cond[0:1], controlnet_cond], dim=0)
+         elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
+             x_t_latent_plus_uc = torch.concat([x_t_latent, x_t_latent], dim=0)
+             t_list = torch.concat([t_list, t_list], dim=0)
++            if controlnet_cond is not None:
++                controlnet_cond = torch.concat([controlnet_cond, controlnet_cond], dim=0)
+         else:
+             x_t_latent_plus_uc = x_t_latent
+ 
++        kwargs = {"encoder_hidden_states": self.prompt_embeds, "return_dict": False}
++        if controlnet_cond is not None:
++            kwargs["controlnet_cond"] = controlnet_cond
++
+         model_pred = self.unet(
+             x_t_latent_plus_uc,
+             t_list,
+-            encoder_hidden_states=self.prompt_embeds,
+-            return_dict=False,
++            **kwargs
+         )[0]
+ 
+         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
+@@ -386,17 +394,31 @@ class StreamDiffusion:
+         )[0]
+         return output_latent
+ 
+-    def predict_x0_batch(self, x_t_latent: torch.Tensor) -> torch.Tensor:
++    def predict_x0_batch(self, x_t_latent: torch.Tensor, controlnet_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+         prev_latent_batch = self.x_t_latent_buffer
+ 
+         if self.use_denoising_batch:
+             t_list = self.sub_timesteps_tensor
++            
++            if controlnet_cond is not None:
++                if self.denoising_steps_num > 1:
++                    if getattr(self, 'controlnet_cond_buffer', None) is None:
++                        # Initialize the buffer with the first condition
++                        self.controlnet_cond_buffer = controlnet_cond.repeat(self.denoising_steps_num - 1, 1, 1, 1)
++                    
++                    controlnet_cond_batch = torch.cat((controlnet_cond, self.controlnet_cond_buffer), dim=0)
++                    self.controlnet_cond_buffer = controlnet_cond_batch[:-self.frame_bff_size]
++                else:
++                    controlnet_cond_batch = controlnet_cond
++            else:
++                controlnet_cond_batch = None
++
+             if self.denoising_steps_num > 1:
+                 x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
+                 self.stock_noise = torch.cat(
+                     (self.init_noise[0:1], self.stock_noise[:-1]), dim=0
+                 )
+-            x_0_pred_batch, model_pred = self.unet_step(x_t_latent, t_list)
++            x_0_pred_batch, model_pred = self.unet_step(x_t_latent, t_list, controlnet_cond=controlnet_cond_batch)
+ 
+             if self.denoising_steps_num > 1:
+                 x_0_pred_out = x_0_pred_batch[-1].unsqueeze(0)
+@@ -438,7 +460,8 @@ class StreamDiffusion:
+ 
+     @torch.no_grad()
+     def __call__(
+-        self, x: Union[torch.Tensor, PIL.Image.Image, np.ndarray] = None
++        self, x: Union[torch.Tensor, PIL.Image.Image, np.ndarray] = None,
++        controlnet_cond: Optional[torch.Tensor] = None
+     ) -> torch.Tensor:
+         start = torch.cuda.Event(enable_timing=True)
+         end = torch.cuda.Event(enable_timing=True)
+@@ -458,7 +481,7 @@ class StreamDiffusion:
+             x_t_latent = torch.randn((1, 4, self.latent_height, self.latent_width)).to(
+                 device=self.device, dtype=self.dtype
+             )
+-        x_0_pred_out = self.predict_x0_batch(x_t_latent)
++        x_0_pred_out = self.predict_x0_batch(x_t_latent, controlnet_cond=controlnet_cond)
+         x_output = self.decode_image(x_0_pred_out).detach().clone()
+ 
+         self.prev_image_result = x_output
+@@ -469,11 +492,12 @@ class StreamDiffusion:
+         return x_output
+ 
+     @torch.no_grad()
+-    def txt2img(self, batch_size: int = 1) -> torch.Tensor:
++    def txt2img(self, batch_size: int = 1, controlnet_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+         x_0_pred_out = self.predict_x0_batch(
+             torch.randn((batch_size, 4, self.latent_height, self.latent_width)).to(
+                 device=self.device, dtype=self.dtype
+-            )
++            ),
++            controlnet_cond=controlnet_cond
+         )
+         x_output = self.decode_image(x_0_pred_out).detach().clone()
+         return x_output
+diff --git a/utils/wrapper.py b/utils/wrapper.py
+index 5c6ac12..71cd855 100644
+--- a/utils/wrapper.py
++++ b/utils/wrapper.py
+@@ -208,6 +208,7 @@ class StreamDiffusionWrapper:
+         self,
+         image: Optional[Union[str, Image.Image, torch.Tensor]] = None,
+         prompt: Optional[str] = None,
++        controlnet_cond: Optional[torch.Tensor] = None,
+     ) -> Union[Image.Image, List[Image.Image]]:
+         """
+         Performs img2img or txt2img based on the mode.
+@@ -218,6 +219,8 @@ class StreamDiffusionWrapper:
+             The image to generate from.
+         prompt : Optional[str]
+             The prompt to generate images from.
++        controlnet_cond : Optional[torch.Tensor]
++            The ControlNet condition image.
+ 
+         Returns
+         -------
+@@ -225,12 +228,12 @@ class StreamDiffusionWrapper:
+             The generated image.
+         """
+         if self.mode == "img2img":
+-            return self.img2img(image, prompt)
++            return self.img2img(image, prompt, controlnet_cond=controlnet_cond)
+         else:
+-            return self.txt2img(prompt)
++            return self.txt2img(prompt, controlnet_cond=controlnet_cond)
+ 
+     def txt2img(
+-        self, prompt: Optional[str] = None
++        self, prompt: Optional[str] = None, controlnet_cond: Optional[torch.Tensor] = None
+     ) -> Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray]:
+         """
+         Performs txt2img.
+@@ -239,10 +242,12 @@ class StreamDiffusionWrapper:
+         ----------
+         prompt : Optional[str]
+             The prompt to generate images from.
++        controlnet_cond : Optional[torch.Tensor]
++            The ControlNet condition image.
+ 
+         Returns
+         -------
+-        Union[Image.Image, List[Image.Image]]
++        Image.Image
+             The generated image.
+         """
+         if prompt is not None:
+@@ -251,7 +256,7 @@ class StreamDiffusionWrapper:
+         if self.sd_turbo:
+             image_tensor = self.stream.txt2img_sd_turbo(self.batch_size)
+         else:
+-            image_tensor = self.stream.txt2img(self.frame_buffer_size)
++            image_tensor = self.stream.txt2img(self.frame_buffer_size, controlnet_cond=controlnet_cond)
+         image = self.postprocess_image(image_tensor, output_type=self.output_type)
+ 
+         if self.use_safety_checker:
+@@ -267,7 +272,7 @@ class StreamDiffusionWrapper:
+         return image
+ 
+     def img2img(
+-        self, image: Union[str, Image.Image, torch.Tensor], prompt: Optional[str] = None
++        self, image: Union[str, Image.Image, torch.Tensor], prompt: Optional[str] = None, controlnet_cond: Optional[torch.Tensor] = None
+     ) -> Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray]:
+         """
+         Performs img2img.
+@@ -276,6 +281,10 @@ class StreamDiffusionWrapper:
+         ----------
+         image : Union[str, Image.Image, torch.Tensor]
+             The image to generate from.
++        prompt : Optional[str]
++            The prompt to generate images from.
++        controlnet_cond : Optional[torch.Tensor]
++            The ControlNet condition image.
+ 
+         Returns
+         -------
+@@ -288,7 +297,7 @@ class StreamDiffusionWrapper:
+         if isinstance(image, str) or isinstance(image, Image.Image):
+             image = self.preprocess_image(image)
+ 
+-        image_tensor = self.stream(image)
++        image_tensor = self.stream(image, controlnet_cond=controlnet_cond)
+         image = self.postprocess_image(image_tensor, output_type=self.output_type)
+ 
+         if self.use_safety_checker:
+-- 
+2.34.1
+

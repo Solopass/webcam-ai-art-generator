@@ -18,3 +18,7 @@ cinematic lighting, 8k resolution, highly detailed, sharp focus
 moody lighting, dark, volumetric fog, dramatic shadows
 
 # Uncategorized
+
+clown alien demon
+
+plasticine, highly detailed, warhammer 40k, eldar, cat girl

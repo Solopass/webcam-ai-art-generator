@@ -1,86 +1,174 @@
-# TensorRT AI VTuber Studio
+# AI VTuber Studio
 
-A real-time AI VTuber engine powered by **StreamDiffusion**, **TensorRT**, and **CustomTkinter**. Turns your webcam—or desktop screen recording—into a customizable, live-animated anime avatar for OBS or Discord.
+Real-time AI restyling of a webcam or screen feed, powered by **StreamDiffusion**,
+**TensorRT** and **CustomTkinter**. Point a camera at yourself, type a prompt, and
+get a live stylised video stream you can send to OBS or Discord.
 
-> **Status: Highly Optimized & Production Ready.** ~26 FPS on an RTX 3080 Ti (2-step, full CFG), smoothed to a buttery 30 FPS output with real-time zero-lag UI tuning. 
+~10 FPS inference on an RTX 3080 Ti, interpolated to ~30 FPS output.
 
-## Features
+```
+Start_GUI.bat            # or: venv\Scripts\python.exe launcher.py
+python run_checks.py     # all GPU-free checks, ~10s
+```
 
-- **Zero-Compile LoRA Hot-Swapping:** Change your character on the fly! The engine uses experimental **TensorRT VRAM Refitting**. You only ever wait 10 minutes to compile the "Universal Base Model" once. From then on, any new character LoRA you download can be hot-swapped into the running GPU memory instantly without ever needing to compile it.
-- **WebP Replay Exports:** Hit `Ctrl+S` (or use the UI button) to instantly save the last 5 seconds of your stream as an animated `.webp` for easy sharing.
-- **Live UI Tuning:** Tune your prompt, CFG, Motion Blur, and trigger sensitivities live via a ZeroMQ event channel without restarting the TensorRT engine.** Tune your prompt, CFG, Motion Blur, and trigger sensitivities live via a ZeroMQ event channel without restarting the TensorRT engine.
-- **MediaPipe Face Tracking:** Dynamically tracks your face, panning and cropping the camera automatically. Maps your real-world facial expressions (smile, closed eyes) directly into the AI prompt!
-- **Audio Lip-Sync:** Speaks when you speak! An FFT audio threshold analyzes your microphone volume to trigger "open mouth" AI generations instantly.
-- **Screen Recording Mode:** Target your desktop monitor to stylize your screen-share instead of your webcam!
-- **AI Green Screen:** Uses Selfie Segmentation to cut you out of your background, perfectly preventing the AI from hallucinating room details into your character.
-- **Background Compositing & Bokeh:** Composite your anime avatar over a custom image, or over your raw room background with an adjustable Gaussian Bokeh blur.
-- **Buttery Motion Blur:** An adjustable temporal lerp filter smooths the AI's native ~26 FPS output into a flawless 30-60 FPS display stream.
-- **OBS Virtual Camera Integration:** Sends the generated output directly to OBS Studio as a virtual webcam.
+First-time setup is `setup.ps1`. **Read the Environment section** — there is a
+patched dependency, and it is the reason a fresh clone can build at all.
 
-## Running it
+---
 
-``bash
-Start_GUI.bat                             # Boot the visual Launcher
-venv\Scripts\python.exe smoke_test.py     # Headless test with a synthetic camera
-python run_checks.py                      # Verify syntax and API arguments
-``
+## The dial that matters: AI Strength
 
-First-time setup on a fresh machine is setup.ps1 — it creates the venv, installs torch and the NVIDIA TensorRT wheel, clones and installs StreamDiffusion, and pins 
-umpy<2. 
-equirements-lock.txt records the exact verified versions and why each one matters.
+The setting people get wrong, including twice in this project's history.
 
-Everything writes to logs/ — ngine-latest.log (with an environment block and full tracebacks) and launcher-latest.log.
+StreamDiffusion starts denoising at a chosen step of a 50-step schedule.
+Timesteps run **most-noisy → least-noisy**, so a *high* step index hands the
+model an almost-finished image and asks for a touch-up. It never gets enough
+noise to discard your real face, so your actual photographic lighting and skin
+texture survive — which is what "it looks 3D, not anime" means.
 
-## Architecture
+| AI Strength | Step index | What you get |
+| --- | --- | --- |
+| 20–30 | 37–35 | Your real face with a filter over it |
+| 40–55 | 32–27 | Recognisably you, clearly stylised |
+| 70–90 | 22–15 | Flat, committed to the prompt |
+| 95–100 | 14–12 | Barely anchored to the webcam |
 
-The engine is highly decoupled into 4 separate threads, guaranteeing that the GPU TensorRT inference is never starved by CPU processing tasks:
+If the output looks like a filtered photo, **raise AI Strength** — CFG cannot
+make the model repaint something it was never given room to repaint.
 
-| Thread | Work |
-| --- | --- |
-| camera_thread | Web/Screen capture → Face Track crop → CLAHE → Selfie Segmentation → Q_IN |
-| cmd_listener | A ZeroMQ PULL socket that asynchronously ingests live slider/UI events. |
-| main thread | TinyVAE encode → TensorRT UNet inference → TinyVAE decode → Q_OUT |
-| postprocess_thread | Unsharp filter → Reinhard colour lock → Saturation → Alpha Compositing → Motion Lerp → ZMQ / OBS Virtual Camera |
+Three other things fight a flat look, and ★ Flat 2D Anime turns them all off:
+**Normalize Lighting (CLAHE)** amplifies real shading on the input; **Sharpness**
+re-adds photographic micro-detail on the output; and a **negative prompt**
+without `3d, render, realistic, photo, octane, blender` isn't pushing back.
 
-Both queues (Q_IN and Q_OUT) hold one frame and the producer **replaces** a stale entry rather than queueing. This allows the camera and post-processing threads to completely overlap the GPU inference time, creating a perfectly parallelized pipeline with zero lag build-up.
+---
 
-## Live Editing
+## Making the AI fill the whole frame
 
-The prompt boxes and all sliders apply while the engine is running. Adjusting sliders sends tiny JSON payloads over the ZeroMQ socket, where the engine instantly hot-loads the new values. 
+By default the AI does **not** cover the picture. Three things confine it:
 
-For the text prompt, the engine re-encodes the CLIP embeddings in-place and copies them into the existing tensor. The new prompt style lands on the very next frame with absolutely zero engine restart required.
+1. **Zoom** — the engine restyles a `min(h, w) / zoom` square. At Zoom 1.9 on a
+   1280×720 camera that's ~379×379, about 8% of the frame.
+2. **Face tracking** — that square follows your face. Turn on **Full Frame Mode**.
+3. **The cutout mask** — segmentation greys out your background before inference
+   *and* masks the result to your silhouette during the paste-back. Turn on
+   **Paint Whole Frame (Disable Cutout Mask)**.
+
+The **★ Full Frame Anime** preset sets all three at once. Paint Whole Frame is
+off by default, so nothing changes until you ask for it.
+
+---
 
 ## Controls
 
-| Control / Hotkey | What it actually does |
+**Live** — apply instantly over ZMQ while the engine runs:
+
+| Control | What it does |
 | --- | --- |
-| **AI Strength** | --t_index (0 step 45, 100 step 12). A high index starts denoising from an almost clean latent, so the output looks like the raw webcam. If the avatar "isn't applying", raise this. *(Requires engine restart).* |
-| **CFG** | --guidance_scale. Adjusts how strictly the AI adheres to the prompt. |
-| **Freeze Filter** | Halts generation while you sit perfectly still (measured via structural similarity) to increase visual quality. Shows [ AI FROZEN ] in the UI when active. |
-| **Manual Freeze (F8)** | Completely pauses the webcam feed and locks the AI onto the current frame. Great for tweaking prompts without worrying about moving. Shows ⏸ Unfreeze (F8) in the UI. |
-| **Randomize Style (Ctrl+R)**| Injects a randomly selected art style into your Master Prompt and immediately applies it. |
-| **Take Snapshot (F12)** | Captures a high-resolution snapshot of the current AI output, webcam frame, and ControlNet condition mask. Saved to snapshots/. |
-| **Save Replay (Ctrl+S)** | Dumps the last 5 seconds of the video buffer into an animated .webp file for instant sharing. |
+| Prompt / Negative | Enter or **Apply ✨**. Ctrl+R rolls a random style. |
+| Prompt Strictness (CFG) | How hard the model chases the prompt. Floor 1.05. |
+| Freeze Filter | Below 1.00, holds the image while you sit still. |
+| Stillness Blend | How much raw webcam is re-fed while frozen. 0 = off. |
+| Motion Blur | Output smoothing between inference frames. |
+| Sharpness | 0 = off. Higher re-adds photographic detail. |
+| Saturation / Brightness | Post-generation colour. |
+| Mask Feather | Softness of the cutout edge. No effect with Paint Whole Frame. |
+| Input Denoise | Smooths webcam grain before the model sees it. |
+| Background Bokeh | Blurs the real background when compositing. |
+| Camera Zoom | Ignored in Full Frame Mode. |
+| LoRA Strength | Applies on the next swap or START — baked in at fuse time. |
+| Character (LoRA) | Hot-swaps live. **Freezes output 30–60s** while TensorRT refits. |
+| Composite Real Background · Paint Whole Frame · VFX opacity & blend mode | |
 
-## Engine Cache
+**Launch-only** — grey out while running, applied on next START: AI Strength,
+Performance Mode, ControlNet, Camera, Seed, and the hardware toggles.
 
-TensorRT engines are cached centrally in `engines_tinyvae_base_...`. The first build takes 10–15 minutes while TensorRT generates a massive benchmark file (`trt_global_timing.cache`). Once this is built, you NEVER have to wait for an engine again. Character LoRAs are injected dynamically at runtime via TensorRT Refitting.
+### Keyboard
+
+| Key | Action |
+| --- | --- |
+| Ctrl+R | Randomize style |
+| Ctrl+S | Save 5s WebP replay |
+| F12 / Ctrl+Space | Snapshot |
+| F8 / Ctrl+F | Manual freeze |
+| F5 / F6 | Previous / next preset |
+| **Hold Tab** | Show the raw camera (A/B compare) |
+
+---
+
+## Presets, history and the self-test
+
+**Style Preset** (Settings tab): Load / Save As… / Delete. The ★ built-ins are
+*partial* — they carry style keys only, so loading one never touches your camera,
+OBS toggle or preview options.
+
+| Preset | For |
+| --- | --- |
+| ★ Flat 2D Anime | Strength 82, CLAHE off, freeze off, anti-3D negatives |
+| ★ Full Frame Anime | Flat 2D **and** paints the entire frame — no crop, no cutout |
+| ★ Painterly | Strength 65, brushwork |
+| ★ Subtle Filter | Strength 30, keeps your real face |
+
+**Session History** (System tab): every START snapshots all settings, newest
+first, labelled by time and prompt. One button restores. Deduped, last 50 kept.
+
+Both live in `presets.json` and `history.json`, **not** `vtuber_settings.json` —
+that file is rebuilt from the widgets on every START and close, so anything in
+it without a widget behind it gets erased.
+
+**🧪 Run Self-Test** (System tab) fires all 23 live commands with their current
+values — nothing changes — and confirms the engine echoes each back, naming any
+that don't answer. Caveat worth knowing: an echo proves the command *arrived*,
+not that it has an effect. A control can answer and still be dead (this happened
+to Freeze), so anything visual still wants eyes on the picture.
+
+---
+
+## Environment
+
+python 3.11.9, torch 2.5.1+cu124, tensorrt 9.0.1, diffusers 0.24.0, mediapipe
+0.10.14, pyzmq 27.2.0, numpy 1.26.4.
+
+- **`StreamDiffusion/` is patched, and the patches live in `patches/`.** That
+  directory is the only copy in version control, because `StreamDiffusion/` is
+  gitignored. `setup.ps1` checks out base `b623251` and applies them. Without
+  them an engine build fails with
+  `TypeError: compile_unet() got an unexpected keyword argument 'timing_cache'`.
+- **numpy must stay below 2** — numpy 2.x breaks this onnxruntime build, which is
+  harmless with cached engines and fatal the moment you rebuild one. The engine
+  logs numpy and onnxruntime versions at startup so you find out first.
+- Two OpenCV distributions are installed and share the `cv2` package; last
+  install wins (currently contrib 5.0.0). First thing to check if cv2 acts odd.
+- Engines cache per `(frame_buffer, steps)` in
+  `engines_tinyvae_base_fb{N}_steps{M}/`. First build is 5–15 minutes.
+
+---
 
 ## Troubleshooting
 
-- **Output is garbage / speckled** — non-finite pixels from the model. This happens if PyTorch's mixed precision breaks or NaN tensors escape the UNet.
-- **Output looks like a lightly filtered webcam** — AI Strength too low (	_index too high), or *Keep Real Background* is on and only your silhouette is being stylised.
-- **Colours strobe frame to frame** — the Reinhard colour lock is on by default to prevent strobe flashing.
-- **Exit code 1** — a worker thread died or the camera stopped delivering frames. The traceback is in logs/engine-latest.log.
-- **Camera won't open** — the engine scans indices 0–5 and prints the ones that responded. Discord, Zoom, Teams and OBS all hold the device exclusively.
+- **Looks 3D / like a filtered photo** → AI Strength too low. See above.
+- **AI only covers my upper body** → zoom, face tracking and the cutout mask.
+  Load ★ Full Frame Anime.
+- **Output froze for ~30–60s** → expected after a LoRA swap; it's the refit.
+- **Engine exits with code 1** → a worker thread died or the camera stopped for
+  30s. Traceback in `logs/engine-latest.log`.
+- **Camera won't open** → the engine scans indices 0–5 and prints which ones
+  responded. Discord, Zoom, Teams and OBS hold the device exclusively.
+
+Everything writes to `logs/`: `engine-latest.log` (environment block, every
+engine line, tracebacks), `launcher-latest.log`, `launcher-crash.log`.
+
+---
 
 ## Directory
 
-- launcher.py — CustomTkinter GUI, spawns and supervises the engine.
-- 
-ealtime_video.py — The core headless TensorRT inference engine.
-- udio_sync.py — Mic-driven FFT volume processing.
-- smoke_test.py — Runs the engine against a synthetic camera.
-- loras/ — Drop .safetensors character models here.
-- logs/ — Engine, launcher and diagnostic output.
-- tuber_settings.json — Saved UI state.
+- `launcher.py` — the GUI; spawns and supervises the engine.
+- `realtime_video.py` — the headless TensorRT inference engine.
+- `audio_sync.py` — mic-driven mouth state.
+- `prompts.md` — prompt-builder dropdown contents.
+- `patches/` — required StreamDiffusion patches. See `patches/README.md`.
+- `run_checks.py`, `test_engine_logic.py`, `test_presets.py` — GPU-free checks.
+- `compile_base_engine.py`, `compile_controlnet_fused.py`, `*.bat` — engine builds.
+- `process_video.py` — offline VFX render of a video file.
+- `presets.json` / `history.json` — style presets and session snapshots.
+- `HANDOFF.md` — engineering notes and invariants. Read before changing code.
