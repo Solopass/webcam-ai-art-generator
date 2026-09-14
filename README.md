@@ -172,3 +172,14 @@ engine line, tracebacks), `launcher-latest.log`, `launcher-crash.log`.
 - `process_video.py` — offline VFX render of a video file.
 - `presets.json` / `history.json` — style presets and session snapshots.
 - `HANDOFF.md` — engineering notes and invariants. Read before changing code.
+
+---
+
+## License
+
+**Source-available, noncommercial.** Copyright © 2026 Solopass. Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+
+- ✅ **Free** for personal use, hobby projects, study and research, and for nonprofits, schools and public institutions.
+- 💼 **Commercial use** (in a business, product or paid service, or for-profit internal use) needs a paid license. See [COMMERCIAL.md](COMMERCIAL.md), or contact [realsolopass@gmail.com](mailto:realsolopass@gmail.com) · <https://polymatica.pages.dev>.
+
+**Third-party code:** this project runs on [StreamDiffusion](https://github.com/cumulo-autumn/StreamDiffusion), which is licensed under Apache-2.0 and is not covered by this license. The files in `patches/` modify StreamDiffusion and remain under Apache-2.0. Model weights and LoRAs have their own licenses.
