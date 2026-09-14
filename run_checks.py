@@ -13,6 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHECKS = [
     ("test_engine_logic.py", "denoise schedule, command coverage, startup order"),
     ("test_presets.py", "presets, history, settings round-trip"),
+    ("test_pixel_liveness.py", "does each control actually change the picture?"),
 ]
 
 results = []

@@ -314,8 +314,23 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
     for _ in range(4):  # warm up the capture device
         cap.read(wait=True)
 
+    # The main loop reports "wait Nms" but could never say WHY the producer was
+    # late. cap.read() does not quantize to camera frames (the new-frame event
+    # stays set while we work, so the next read returns at once), which means
+    # the producer's cycle is pure CPU — and at 10.0 FPS with 76ms of inference
+    # and 21ms of wait, that CPU is the actual bottleneck. These timers say
+    # which stage owns it instead of leaving it to guesswork.
+    cam_t0 = time.time()
+    cam_n = 0
+    cam_stage = {"read": 0.0, "face": 0.0, "prep": 0.0, "seg": 0.0,
+                 "mesh": 0.0, "cond": 0.0}
+    seg_cache = None
+    prev_emotions = []
+
     while not STOP.is_set():
+        _t = time.perf_counter()
         ret, frame, counter = cap.read(wait=True)
+        cam_stage["read"] += time.perf_counter() - _t
         if not ret or frame is None:
             continue
 
@@ -331,6 +346,7 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
             target_y = (h - size) // 2
             current_x, current_y = target_x, target_y
 
+        _t = time.perf_counter()
         if face_detector is not None and counter % 5 == 0:
             small_rgb = cv2.cvtColor(cv2.resize(frame, (w // 4, h // 4)), cv2.COLOR_BGR2RGB)
             try:
@@ -348,12 +364,23 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
         current_y = int(current_y * 0.8 + target_y * 0.2)
 
         if args.no_face_track:
-            cw, ch = w, h
-            cropped = frame
+            # Zoom used to be dropped entirely here while its slider still said
+            # it zoomed. Crop a centred rect of the SAME aspect ratio so the
+            # framing stays full-frame. zoom == 1.0 is a byte-identical no-op.
+            if zoom > 1.001:
+                cw, ch = max(16, int(w / zoom)), max(16, int(h / zoom))
+                ox, oy = (w - cw) // 2, (h - ch) // 2
+                cropped = frame[oy:oy + ch, ox:ox + cw]
+            else:
+                cw, ch = w, h
+                ox = oy = 0
+                cropped = frame
         else:
             cw, ch = size, size
             cropped = frame[current_y:current_y + size, current_x:current_x + size]
         
+        cam_stage["face"] += time.perf_counter() - _t
+        _t = time.perf_counter()
         resized = cv2.resize(cropped, (512, 512))
         frame_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
@@ -377,12 +404,25 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
                 cv2.accumulateWeighted(f32, prev_input, temporal_denoise)
                 frame_rgb = cv2.convertScaleAbs(prev_input)
 
+        cam_stage["prep"] += time.perf_counter() - _t
+        _t = time.perf_counter()
         soft_mask = None
         # Live-toggleable: the segmenter object is built once, but whether we
         # USE it is re-read every frame so "Paint Whole Frame" works mid-run.
         # Leaving soft_mask as None disables both the grey-screen below and the
         # silhouette mask in postprocess_thread's HD paste-back.
         use_segmenter = segmenter is not None and not state_dict.get("no_segment", args.no_segment)
+        # --segment_every N reuses the previous mask on the frames in between.
+        # At 30fps a silhouette barely moves in 33ms, so N=2 halves the cost of
+        # the most expensive stage for a difference you have to look for.
+        # Default 1 = run every frame, exactly as before.
+        seg_every = max(1, int(getattr(args, "segment_every", 1)))
+        if use_segmenter and seg_every > 1 and counter % seg_every != 0 and seg_cache is not None:
+            soft_mask = seg_cache
+            alpha = soft_mask[..., np.newaxis].astype(np.float32)
+            frame_rgb = (frame_rgb.astype(np.float32) * alpha
+                         + np.float32(64.0) * (1.0 - alpha)).astype(np.uint8)
+            use_segmenter = False
         if use_segmenter:
             try:
                 small_rgb = cv2.resize(original_frame_rgb, (256, 256), interpolation=cv2.INTER_LINEAR)
@@ -404,12 +444,21 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
                     grey = np.float32(64.0)
                     frame_rgb = (frame_rgb.astype(np.float32) * alpha
                                  + grey * (1.0 - alpha)).astype(np.uint8)
+                    seg_cache = soft_mask
             except Exception as e:
                 log(f"[Camera] Segmentation failed ({e}); compositing the full AI frame.")
                 soft_mask = None
 
+        cam_stage["seg"] += time.perf_counter() - _t
+        _t = time.perf_counter()
         emotions = []
-        if face_mesh is not None:
+        mesh_every = max(1, int(getattr(args, "mesh_every", 1)))
+        run_mesh = face_mesh is not None and counter % mesh_every == 0
+        if face_mesh is not None and not run_mesh:
+            # Reuse the last expression state rather than dropping to neutral,
+            # which would make the mouth flicker shut every other frame.
+            emotions = list(prev_emotions)
+        if run_mesh:
             try:
                 fm_res = face_mesh.process(frame_rgb)
                 if fm_res.multi_face_landmarks:
@@ -480,6 +529,20 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
 
         # Always keep the freshest frame waiting in the slot. Skipping the work
         # whenever the slot was full (an earlier "optimisation" of mine) served
+        cam_stage["cond"] += time.perf_counter() - _t
+        prev_emotions = list(emotions)
+        cam_n += 1
+        _el = time.time() - cam_t0
+        if _el > 5.0 and cam_n:
+            per = {k: v / cam_n * 1000.0 for k, v in cam_stage.items()}
+            total = sum(per.values())
+            log("[Camera] {:.1f} fps produced | {:.1f}ms/frame = ".format(cam_n / _el, total)
+                + "  ".join(f"{k} {per[k]:.1f}" for k in
+                            ("read", "face", "prep", "seg", "mesh", "cond")))
+            cam_t0 = time.time()
+            cam_n = 0
+            cam_stage = {k: 0.0 for k in cam_stage}
+
         # the camera wait and the CPU preprocessing *in series* with the GPU
         # instead of overlapping them, which cost more throughput than the
         # MediaPipe calls it saved. The producer must stay ahead of the GPU.
@@ -489,7 +552,13 @@ def camera_thread(cap, args, state_dict, controlnet_aux_models):
             except queue.Empty:
                 pass
         try:
-            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions, cond_final, frame, (current_x if not args.no_face_track else 0, current_y if not args.no_face_track else 0, cw, ch)))
+            # The paste-back origin must be the origin we actually cropped at.
+            # Hardcoding 0,0 for Full Frame Mode was correct only while zoom was
+            # ignored there; now that zoom crops a centred rect, a 0,0 paste puts
+            # the stylised image in the top-left corner, half a frame off.
+            crop_origin = (ox, oy) if args.no_face_track else (current_x, current_y)
+            Q_IN.put_nowait((frame_rgb, soft_mask, original_frame_rgb, emotions,
+                             cond_final, frame, (crop_origin[0], crop_origin[1], cw, ch)))
         except queue.Full:
             pass
 
@@ -541,32 +610,37 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                 raw_out_frame, soft_mask, original_frame_rgb = item
                 cond_final = None
     
-            if args.post_processing:
-                # All three were hardcoded (1.4/-0.4 unsharp, +20 sat, +10 val).
-                # The defaults below reproduce those exactly, so the picture is
-                # unchanged until a slider is moved.
-                sharpness = float(state_dict.get("sharpness", args.sharpness))
-                if abs(sharpness) > 0.01:
-                    amount = 0.4 * sharpness
-                    gaussian = cv2.GaussianBlur(raw_out_frame, (0, 0), 1.5)
-                    out_frame = cv2.addWeighted(raw_out_frame, 1.0 + amount,
-                                                gaussian, -amount, 0)
-                else:
-                    out_frame = raw_out_frame
-
-                sat = int(state_dict.get("saturation", args.saturation))
-                bright = int(state_dict.get("brightness", args.brightness))
-                if sat or bright:
-                    hsv = cv2.cvtColor(out_frame, cv2.COLOR_BGR2HSV)
-                    h, s, v = cv2.split(hsv)
-                    if sat:
-                        s = cv2.add(s, sat) if sat > 0 else cv2.subtract(s, -sat)
-                    if bright:
-                        v = cv2.add(v, bright) if bright > 0 else cv2.subtract(v, -bright)
-                    out_frame = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+            # NOT gated on args.post_processing. That flag is store_true and
+            # build_command never emitted it, so this entire stage was dead in
+            # every GUI run: Sharpness, Saturation and Brightness each logged
+            # their new value, passed the self-test, and changed nothing.
+            #
+            # The defaults are now neutral (0 / 0 / 0) rather than the old
+            # hardcoded 1.0 / +20 / +10, so an untouched slider is a true no-op
+            # and the picture matches what it was while this code was dead.
+            # Turning the stage on WITHOUT that change would have suddenly
+            # sharpened and saturated everyone's output.
+            sharpness = float(state_dict.get("sharpness", args.sharpness))
+            if abs(sharpness) > 0.01:
+                amount = 0.4 * sharpness
+                gaussian = cv2.GaussianBlur(raw_out_frame, (0, 0), 1.5)
+                out_frame = cv2.addWeighted(raw_out_frame, 1.0 + amount,
+                                            gaussian, -amount, 0)
             else:
                 out_frame = raw_out_frame
-                
+
+            sat = int(state_dict.get("saturation", args.saturation))
+            bright = int(state_dict.get("brightness", args.brightness))
+            if sat or bright:
+                hsv = cv2.cvtColor(out_frame, cv2.COLOR_BGR2HSV)
+                h, s, v = cv2.split(hsv)
+                if sat:
+                    s = cv2.add(s, sat) if sat > 0 else cv2.subtract(s, -sat)
+                if bright:
+                    v = cv2.add(v, bright) if bright > 0 else cv2.subtract(v, -bright)
+                out_frame = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+
+
             if state_dict.pop("save_snapshot", False):
                 save_dir = os.path.join(SCRIPT_DIR, "snapshots")
                 os.makedirs(save_dir, exist_ok=True)
@@ -574,13 +648,31 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                 cv2.imwrite(os.path.join(save_dir, f"snap_{ts}_ai.png"), out_frame)
                 cv2.imwrite(os.path.join(save_dir, f"snap_{ts}_webcam.png"), cv2.cvtColor(original_frame_rgb, cv2.COLOR_RGB2BGR))
                 if cond_final is not None:
-                    import torch
-                    cond_img = (cond_final[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                    cond_img = cv2.cvtColor(cond_img, cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(os.path.join(save_dir, f"snap_{ts}_edges.png"), cond_img)
+                    # --controlnet multi concatenates two detectors, so this is
+                    # 6 channels, not 3, and cvtColor raised cv2.error. The only
+                    # handler around this block catches queue.Empty, so the
+                    # exception escaped postprocess_thread, tripped FAILED and
+                    # took the engine down with exit 1 — one Snapshot press.
+                    try:
+                        cond_img = (cond_final[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        ch_n = cond_img.shape[2] if cond_img.ndim == 3 else 1
+                        if ch_n >= 3:
+                            cond_img = cv2.cvtColor(cond_img[:, :, :3], cv2.COLOR_RGB2BGR)
+                        elif ch_n == 1:
+                            cond_img = cv2.cvtColor(cond_img[:, :, 0], cv2.COLOR_GRAY2BGR)
+                        else:
+                            cond_img = cv2.cvtColor(cond_img[:, :, 0], cv2.COLOR_GRAY2BGR)
+                        cv2.imwrite(os.path.join(save_dir, f"snap_{ts}_edges.png"), cond_img)
+                    except Exception as e:
+                        log(f"[Engine] Snapshot: skipped the ControlNet preview ({e}).")
                 log(f"[Engine] Saved high-res snapshot to snapshots/snap_{ts}_*.png")
     
-            if soft_mask is not None:
+            # Only a fallback now. When full_frame/crop_coords are present the
+            # HD paste-back below composites at full resolution, and doing it
+            # here as well applied the mask TWICE: a pixel with alpha 0.5 came
+            # out 0.25*AI instead of 0.5*AI, so the feathered silhouette edge
+            # was thinner and washed out compared with the Mask Feather value.
+            if soft_mask is not None and (full_frame is None or crop_coords is None):
                 alpha = soft_mask[..., np.newaxis].astype(np.float32)
                 if bg_img_cache is not None:
                     out_frame = (out_frame.astype(np.float32) * alpha + bg_img_cache.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
@@ -628,7 +720,9 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
         display_frame = current_smoothed_frame.astype(np.uint8)
 
         vfx_blend_mode = state_dict.get("vfx_blend_mode", "Normal")
-        vfx_opacity = state_dict.get("vfx_opacity", 1.0)
+        # Unclamped, a value above 1.0 extrapolates highlights past 255 and
+        # the uint8 cast at the end of the blend wraps them to black.
+        vfx_opacity = max(0.0, min(1.0, float(state_dict.get("vfx_opacity", 1.0))))
         
         # HD VFX Compositing
         if full_frame is not None and crop_coords is not None:
@@ -690,7 +784,21 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                 final_ai = (blended * vfx_opacity) + (base_region * (1.0 - vfx_opacity))
                 
                 if mask_resized is not None:
-                    final_ai = (final_ai * mask_resized) + (base_region * (1.0 - mask_resized))
+                    # The background put behind the subject at 512 used to be
+                    # discarded here: this line pasted the real camera room back
+                    # wherever the mask was ~0. A BG image was therefore never
+                    # visible at all, and Background Bokeh blurred a background
+                    # nobody ever saw. Both now apply at full resolution.
+                    bg_hd = base_region
+                    if bg_img_cache is not None:
+                        bg_hd = cv2.resize(bg_img_cache, (cw, ch)).astype(np.float32)
+                    else:
+                        bokeh = state_dict.get("bokeh_blur", args.bokeh_blur)
+                        if bokeh > 0.01:
+                            bk = max(1, int(bokeh * 40)) | 1
+                            bg_hd = cv2.GaussianBlur(hd_region, (bk, bk), 0).astype(np.float32)
+                    final_ai = (final_ai * mask_resized) + (bg_hd * (1.0 - mask_resized))
+
                     
                 full_frame[cy:cy+ch, cx:cx+cw] = final_ai.astype(np.uint8)
                 display_frame = full_frame
@@ -725,7 +833,21 @@ def postprocess_thread(args, zmq_socket, vcam, state_dict):
                     display_frame = full_frame
 
         if vcam is not None:
-            hd = cv2.resize(display_frame, (1024, 1024), interpolation=cv2.INTER_LINEAR)
+            # display_frame became the full HD camera frame when the HD
+            # paste-back landed; squeezing 1280x720 into the 1024x1024 device
+            # stretched everyone vertically by 1.78x in OBS while the GUI
+            # preview (which is not resized) still looked correct. Letterbox
+            # instead, so nothing is distorted and nothing is cropped away.
+            _dh, _dw = display_frame.shape[:2]
+            if _dw == _dh:
+                hd = cv2.resize(display_frame, (1024, 1024), interpolation=cv2.INTER_LINEAR)
+            else:
+                _sc = min(1024.0 / _dw, 1024.0 / _dh)
+                _nw, _nh = max(1, int(round(_dw * _sc))), max(1, int(round(_dh * _sc)))
+                hd = np.zeros((1024, 1024, 3), dtype=np.uint8)
+                _ox, _oy = (1024 - _nw) // 2, (1024 - _nh) // 2
+                hd[_oy:_oy + _nh, _ox:_ox + _nw] = cv2.resize(
+                    display_frame, (_nw, _nh), interpolation=cv2.INTER_LINEAR)
             try:
                 vcam.send(cv2.cvtColor(hd, cv2.COLOR_BGR2RGB))
                 vcam.sleep_until_next_frame()
@@ -811,9 +933,9 @@ def build_args():
                              "AI avatar over it.")
     parser.add_argument("--no_face_track", action="store_true")
     # Live image controls. Defaults reproduce the previously hardcoded values.
-    parser.add_argument("--sharpness", type=float, default=1.0)
-    parser.add_argument("--saturation", type=int, default=20)
-    parser.add_argument("--brightness", type=int, default=10)
+    parser.add_argument("--sharpness", type=float, default=0.0)
+    parser.add_argument("--saturation", type=int, default=0)
+    parser.add_argument("--brightness", type=int, default=0)
     parser.add_argument("--mask_feather", type=int, default=7)
     parser.add_argument("--stillness_blend", type=float, default=0.3)
     parser.add_argument("--vfx_opacity", type=float, default=1.0)
@@ -822,6 +944,12 @@ def build_args():
     # given prompt + seed reproducible between runs.
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--lora_strength", type=float, default=1.0)
+    parser.add_argument("--segment_every", type=int, default=1,
+                        help="Run the segmenter every Nth frame and reuse the "
+                             "mask in between. 1 = every frame (unchanged).")
+    parser.add_argument("--mesh_every", type=int, default=1,
+                        help="Run the FaceMesh expression tracker every Nth "
+                             "frame. 1 = every frame (unchanged).")
     parser.add_argument("--no_segment", action="store_true",
                         help="Skip MediaPipe selfie segmentation entirely. Without "
                              "it the input is grey-screened before inference AND the "
@@ -861,6 +989,14 @@ def build_args():
     # Floor of 2, not 0: the two-step schedule needs room for a distinct first
     # step below t_index. The GUI never sends below 12.
     args.t_index = max(2, min(49, args.t_index))
+    # frame_buffer > 1 duplicates ONE frame (`x_in.repeat(fb, ...)`) and then
+    # keeps only `output_image[-1]`, so it is 2x the UNet work for an identical
+    # picture. Nothing in the GUI selects it; clamp so a stray CLI flag cannot
+    # silently halve the frame rate.
+    if args.frame_buffer > 1:
+        log(f"[Engine] frame_buffer={args.frame_buffer} ignored: it duplicates a "
+            f"single frame and discards the extra output. Using 1.")
+        args.frame_buffer = 1
     return args
 
 
@@ -950,6 +1086,12 @@ def cmd_listener_thread(port, state_dict):
                             if _k in cmd:
                                 state_dict[_k] = cmd[_k]
                                 log(f"[Engine] {_label}: {cmd[_k]}")
+                        if "lora_refresh" in cmd:
+                            # Re-fuse the CURRENT LoRA at the current strength.
+                            # The strength slider used to log its new value and
+                            # then do nothing until you happened to change LoRA.
+                            state_dict["lora_refresh"] = True
+                            log("[Engine] LoRA Refresh: re-fusing at the current strength.")
                         if "ab_raw" in cmd:
                             state_dict["ab_raw"] = bool(cmd["ab_raw"])
                         if "lora" in cmd:
@@ -968,6 +1110,24 @@ def cmd_listener_thread(port, state_dict):
         except Exception:
             pass
 
+
+
+class EngineStopped(Exception):
+    """STOP arrived during a long startup step."""
+
+
+def _abort_if_stopped(where):
+    """STOP was honoured only AFTER the whole model load returned, so a stop
+    during a 5-15 minute build was ignored, the launcher's 6s grace expired and
+    it fell through to TerminateProcess — 'exited with code 1 (see the error
+    above)' with no error above, and a risk of a truncated unet.engine.
+
+    These checkpoints sit between the startup steps. The TensorRT build itself
+    is a single opaque call that cannot be interrupted, so a stop landing
+    inside it still has to wait it out; everything around it now exits clean."""
+    if STOP.is_set():
+        log(f"[Engine] Stop received during startup ({where}); exiting cleanly.")
+        raise EngineStopped(where)
 
 
 def load_model_and_engine(args, lora_name):
@@ -1041,6 +1201,7 @@ def load_model_and_engine(args, lora_name):
     log(f"[Engine] Applying TensorRT acceleration ({os.path.basename(engine_dir)}).")
     if not os.path.exists(os.path.join(engine_dir, "unet.engine")):
         log("[Engine] No cached engine found — the first build takes 5-15 minutes. Please wait.")
+    _abort_if_stopped("before the TensorRT build")
     stream = accelerate_with_tensorrt(
         stream,
         engine_dir,
@@ -1067,7 +1228,20 @@ def load_model_and_engine(args, lora_name):
         if os.path.exists(lora_path):
             scale = float(getattr(args, "lora_strength", 1.0))
             try:
-                pipe.load_lora_weights(lora_path)
+                # NOT pipe.load_lora_weights(): that always calls
+                # load_lora_into_unet FIRST, and accelerate_with_tensorrt does
+                # `del stream.pipe.unet` without ever restoring it. Diffusers'
+                # __getattr__ then falls through to the config, so pipe.unet is
+                # the tuple ('diffusers', 'UNet2DConditionModel') and every run
+                # logged "'tuple' object has no attribute 'load_attn_procs'" —
+                # the text encoder never saw the LoRA and trigger tokens did
+                # nothing. fuse_unet=False could not help: the crash happened
+                # in load_lora_weights, before fuse_lora was reached.
+                # Loading straight into the text encoder skips the dead UNet.
+                sd_lora, alphas = StableDiffusionPipeline.lora_state_dict(lora_path)
+                StableDiffusionPipeline.load_lora_into_text_encoder(
+                    sd_lora, network_alphas=alphas,
+                    text_encoder=pipe.text_encoder, lora_scale=scale)
                 pipe.fuse_lora(fuse_unet=False, fuse_text_encoder=True,
                                lora_scale=scale)
                 log(f"[Engine] Fused '{lora_name}' into the TEXT ENCODER "
@@ -1078,6 +1252,7 @@ def load_model_and_engine(args, lora_name):
         else:
             log(f"[Engine] LoRA not found for text-encoder fuse: {lora_path}")
 
+    _abort_if_stopped("after the TensorRT build")
     controlnet_aux_models = {}
     if args.controlnet != "none":
         from streamdiffusion.acceleration.tensorrt.engine import UNet2DConditionModelEngine
@@ -1107,11 +1282,23 @@ def load_model_and_engine(args, lora_name):
 
     return pipe, stream, controlnet_aux_models
 
-def refit_lora_to_trt(stream, args, lora_name, state=None):
+def refit_prepare(stream, args, lora_name, state=None):
+    """The slow half of a LoRA refit. Touches NO TensorRT state.
+
+    Reloads the PyTorch pipeline, fuses the LoRAs into it, and exports the
+    optimized ONNX the refit will read. Everything here works on a private
+    pipeline and on files under `engine_dir/onnx/`; the only thing it reads
+    from `stream` is `trt_unet_batch_size`, an int fixed at build time. It
+    never touches the live engine, which is what makes it safe to run on a
+    worker thread while inference keeps drawing frames.
+
+    Returns `(base_onnx, refit_opt_onnx)` for `refit_apply`, or None when
+    there is nothing to refit.
+    """
     state = state if state is not None else {"lora_strength": getattr(args, "lora_strength", 1.0)}
     if args.controlnet != "none":
         log(f"[WARNING] LoRA hot-swapping is currently not supported when using Fused ControlNet ({args.controlnet}). Ignoring LoRA {lora_name}.")
-        return
+        return None
 
     import gc
     from diffusers import StableDiffusionPipeline
@@ -1119,54 +1306,94 @@ def refit_lora_to_trt(stream, args, lora_name, state=None):
     from streamdiffusion.acceleration.tensorrt.utilities import export_onnx, optimize_onnx
     
     log(f"[Engine] Starting dynamic TRT Refit for LoRA: {lora_name}")
-    engine_dir = os.path.join(SCRIPT_DIR, f"engines_tinyvae_base_fb{args.frame_buffer}_steps{args.steps}")
-    
-    log("[Engine] Reloading PyTorch UNet into RAM...")
-    pipe = StableDiffusionPipeline.from_pretrained(
-        "KBlueLeaf/kohaku-v2.1",
-        torch_dtype=torch.float16,
-        safety_checker=None,
-    ).to("cuda")
-    
-    if lora_name and lora_name.lower() != "none":
-        lora_path = os.path.join(SCRIPT_DIR, "loras", lora_name)
-        if os.path.exists(lora_path):
-            log(f"[Engine] Fusing {lora_name} into UNet...")
-            pipe.load_lora_weights(lora_path)
-            pipe.fuse_lora(lora_scale=float(state.get("lora_strength", 1.0)))
-    
-    log("[Engine] Fusing LCM-LoRA...")
-    pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
-    pipe.fuse_lora()
-    
-    log("[Engine] Exporting temporary refit ONNX...")
-    unet_model = UNet(
-        fp16=True,
-        device=pipe.device,
-        max_batch_size=stream.trt_unet_batch_size,
-        min_batch_size=1,
-        embedding_dim=pipe.text_encoder.config.hidden_size,
-        unet_dim=pipe.unet.config.in_channels,
-    )
+    # Must match load_model_and_engine's key exactly, cfg_suffix included, or a
+    # non-default --cfg_type refits against the wrong ONNX directory and fails.
+    cfg_suffix = "" if args.cfg_type == "full" else f"_cfg{args.cfg_type}"
+    engine_dir = os.path.join(
+        SCRIPT_DIR,
+        f"engines_tinyvae_base_fb{args.frame_buffer}_steps{args.steps}{cfg_suffix}")
     
     base_onnx = os.path.join(engine_dir, "onnx", "unet.opt.onnx")
     refit_onnx = os.path.join(engine_dir, "onnx", "unet_refit.onnx")
     refit_opt_onnx = os.path.join(engine_dir, "onnx", "unet_refit.opt.onnx")
-    
-    export_onnx(pipe.unet, refit_onnx, unet_model, 512, 512, stream.trt_unet_batch_size, 17)
-    
-    log("[Engine] Optimizing refit ONNX...")
-    optimize_onnx(refit_onnx, refit_opt_onnx, unet_model)
-    
+
+    # A copied engine cache has no onnx/ beside it, and the refit reads the
+    # base graph from there. Fail here with a reason the user can act on,
+    # rather than deep inside TensorRT after a 60-second export.
+    if not os.path.exists(base_onnx):
+        raise FileNotFoundError(
+            f"{base_onnx} is missing, so this engine cannot be refitted. It only "
+            f"exists on the machine that built the engine; delete {engine_dir} and "
+            f"let it rebuild, or choose the LoRA before pressing START.")
+
+    pipe = None
+    try:
+        log("[Engine] Reloading PyTorch UNet into RAM...")
+        pipe = StableDiffusionPipeline.from_pretrained(
+            "KBlueLeaf/kohaku-v2.1",
+            torch_dtype=torch.float16,
+            safety_checker=None,
+        ).to("cuda")
+
+        if lora_name and lora_name.lower() != "none":
+            lora_path = os.path.join(SCRIPT_DIR, "loras", lora_name)
+            if os.path.exists(lora_path):
+                log(f"[Engine] Fusing {lora_name} into UNet...")
+                pipe.load_lora_weights(lora_path)
+                pipe.fuse_lora(lora_scale=float(state.get("lora_strength", 1.0)))
+
+        log("[Engine] Fusing LCM-LoRA...")
+        pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
+        pipe.fuse_lora()
+
+        log("[Engine] Exporting temporary refit ONNX...")
+        unet_model = UNet(
+            fp16=True,
+            device=pipe.device,
+            max_batch_size=stream.trt_unet_batch_size,
+            min_batch_size=1,
+            embedding_dim=pipe.text_encoder.config.hidden_size,
+            unet_dim=pipe.unet.config.in_channels,
+        )
+
+        export_onnx(pipe.unet, refit_onnx, unet_model, 512, 512, stream.trt_unet_batch_size, 17)
+
+        log("[Engine] Optimizing refit ONNX...")
+        optimize_onnx(refit_onnx, refit_opt_onnx, unet_model)
+    finally:
+        # Free the second copy of the UNet here, not at the call site: the
+        # refit reads its ONNX off disk and needs nothing from `pipe`. Giving
+        # back ~2GB before we go anywhere near the engine also keeps the VRAM
+        # peak down, which matters now that this runs alongside live inference.
+        del pipe
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    return base_onnx, refit_opt_onnx
+
+
+def refit_apply(stream, base_onnx, refit_opt_onnx):
+    """The only part of a refit that mutates the live engine.
+
+    MUST run on the inference thread. `engine.refit` rewrites the weights the
+    execution context reads, so it cannot overlap a `stream()` call, and
+    clearing `cuda_graph_instance` forces a re-capture — which is only legal
+    when no other thread is issuing CUDA work.
+    """
     log("[Engine] Refitting TensorRT Engine in VRAM... (Expect a 1-second freeze)")
     stream.unet.engine.refit(base_onnx, refit_opt_onnx)
     stream.unet.engine.cuda_graph_instance = None
-    
     log("[Engine] Dynamic Refit Complete! Resuming stream.")
-    
-    del pipe
-    gc.collect()
-    torch.cuda.empty_cache()
+
+
+def refit_lora_to_trt(stream, args, lora_name, state=None):
+    """Blocking prepare + apply, for the startup path where nothing is
+    streaming yet. The hot-swap path in `main` runs the two halves separately
+    so the picture keeps moving through the slow one."""
+    prepared = refit_prepare(stream, args, lora_name, state)
+    if prepared is None:
+        return
+    refit_apply(stream, *prepared)
 
 def main():
     args = build_args()
@@ -1227,14 +1454,34 @@ def main():
         cmd_t.start()
         log(f"[Engine] Listening for commands on port {args.cmd_port}")
 
-    pipe, stream, controlnet_aux_models = load_model_and_engine(args, args.lora)
+    try:
+        pipe, stream, controlnet_aux_models = load_model_and_engine(args, args.lora)
+    except EngineStopped:
+        return
     if STOP.is_set():
         log("[Engine] Stop received during startup; exiting before inference.")
         return
 
     current_lora = args.lora if (args.lora and args.lora.lower() != "none") else "None"
     if current_lora != "None":
+        # Blocking is correct here: nothing is streaming yet, so there is no
+        # picture to protect, and START must not begin before the weights the
+        # user asked for are actually in the engine.
+        _abort_if_stopped("before the startup LoRA refit")
         refit_lora_to_trt(stream, args, args.lora, state_dict)
+        if STOP.is_set():
+            log("[Engine] Stop received after the LoRA refit; exiting cleanly.")
+            return
+
+    # In-flight background LoRA prep, or None. Only ever one at a time — a
+    # second swap request stays in state_dict until this one lands, rather
+    # than racing two exports over the same unet_refit.onnx.
+    refit_job = None
+
+    # The live CFG value. Must be a separate variable from args.guidance_scale,
+    # because the freeze branch in the loop rewrites stream.guidance_scale every
+    # iteration and would otherwise clobber whatever the slider sent.
+    live_cfg = args.guidance_scale
 
     log(f"[Engine] Preparing (t_index={args.t_index}, cfg={args.cfg_type}, "
         f"guidance={args.guidance_scale}, delta={args.delta})")
@@ -1313,24 +1560,20 @@ def main():
             # cosine similarity metric conflicts with our structural MSE metric,
             # causing 1-FPS ghosting. We handle freezing entirely via is_frozen.
             
+            # The CFG slider writes live_cfg, NOT stream.guidance_scale. The
+            # freeze branch below reassigns stream.guidance_scale on every
+            # single iteration, so anything written here was overwritten ~140
+            # lines later, before stream() ever saw it: the slider logged its
+            # new value and changed nothing. Same trap as the freeze threshold.
+            # (This block used to appear twice, verbatim; the first pop() made
+            # the second copy unreachable.)
             if "guidance_scale" in state_dict:
-                val = state_dict.pop("guidance_scale")
-                stream.guidance_scale = val
+                live_cfg = state_dict.pop("guidance_scale")
                 # When turning off CFG, we MUST empty the prompt tensor so StreamDiffusion disables CFG!
-                if stream.guidance_scale <= 1.0 and stream.prompt_embeds.shape[0] > stream.batch_size:
+                if live_cfg <= 1.0 and stream.prompt_embeds.shape[0] > stream.batch_size:
                     stream.prompt_embeds = stream.prompt_embeds[stream.batch_size:]
                 # When turning ON CFG, we must re-prepare!
-                elif stream.guidance_scale > 1.0 and stream.prompt_embeds.shape[0] == stream.batch_size:
-                    state_dict["prompt_dirty"] = True
-            
-            if "guidance_scale" in state_dict:
-                val = state_dict.pop("guidance_scale")
-                stream.guidance_scale = val
-                # When turning off CFG, we MUST empty the prompt tensor so StreamDiffusion disables CFG!
-                if stream.guidance_scale <= 1.0 and stream.prompt_embeds.shape[0] > stream.batch_size:
-                    stream.prompt_embeds = stream.prompt_embeds[stream.batch_size:]
-                # When turning ON CFG, we must re-prepare!
-                elif stream.guidance_scale > 1.0 and stream.prompt_embeds.shape[0] == stream.batch_size:
+                elif live_cfg > 1.0 and stream.prompt_embeds.shape[0] == stream.batch_size:
                     state_dict["prompt_dirty"] = True
 
             t_wait = time.perf_counter()
@@ -1446,7 +1689,7 @@ def main():
                 is_frozen = True
                 
             if is_frozen:
-                stream.guidance_scale = min(args.guidance_scale * 1.5, 4.0)
+                stream.guidance_scale = min(live_cfg * 1.5, 4.0)
                 # How much raw webcam gets folded back in while you hold
                 # still. Was a hidden 0.3; 0.0 disables the feedback entirely.
                 sb = float(state_dict.get("stillness_blend", args.stillness_blend))
@@ -1455,7 +1698,7 @@ def main():
                 # Skip PIL conversion and go straight to GPU Tensor
                 x_in = torch.from_numpy(refinement_frame).permute(2, 0, 1).unsqueeze(0).to("cuda", dtype=torch.float16) / 255.0
             else:
-                stream.guidance_scale = args.guidance_scale
+                stream.guidance_scale = live_cfg
                 # Skip PIL conversion and go straight to GPU Tensor
                 x_in = torch.from_numpy(frame_rgb).permute(2, 0, 1).unsqueeze(0).to("cuda", dtype=torch.float16) / 255.0
             
@@ -1474,36 +1717,80 @@ def main():
             
             t_done = time.perf_counter()
 
-            if "lora" in state_dict and state_dict["lora"] != current_lora:
-                new_lora = state_dict.pop("lora")
+            # --- LoRA hot-swap, phase 1: start the slow half off-thread -------
+            # Everything expensive (pipeline reload, LoRA fuse, ONNX export and
+            # optimize) runs on a worker while this loop keeps producing frames.
+            # Only the engine refit itself comes back to this thread, below.
+            # Guarded by refit_job: popping while a prep is in flight would
+            # consume and DISCARD a swap the user asked for. test 16 caught
+            # exactly that when this was written without the guard.
+            pending_lora = None
+            if refit_job is None:
+                if "lora" in state_dict and state_dict["lora"] != current_lora:
+                    pending_lora = state_dict.pop("lora")
+                elif state_dict.pop("lora_refresh", False) and current_lora != "None":
+                    # Same machinery, same LoRA, new strength.
+                    pending_lora = current_lora
+            if refit_job is None and pending_lora is not None:
+                new_lora = pending_lora
                 log(f"[Engine] LoRA hot-swap requested: {current_lora} -> {new_lora}")
-                log("[Engine] === HOT-SWAP: output will FREEZE for 30-60s while the "
-                    "UNet is re-fused, exported and refitted. This is not a hang. ===")
-                current_lora = new_lora
+                log(f"[Engine] === HOT-SWAP: preparing '{new_lora}' in the background. "
+                    "The stream keeps running (slower — the GPU is shared) for "
+                    "30-60s, then freezes ~1s for the engine refit. ===")
+                refit_job = {"lora": new_lora, "result": None, "error": None}
 
-                try:
-                    refit_lora_to_trt(stream, args, current_lora, state_dict)
-                except Exception as e:
+                def _refit_worker(job=refit_job):
+                    try:
+                        job["result"] = refit_prepare(stream, args, job["lora"], state_dict)
+                    except Exception as e:
+                        job["error"] = e
+
+                refit_job["thread"] = threading.Thread(
+                    target=_refit_worker, daemon=True, name="refit-prep")
+                refit_job["thread"].start()
+
+            # --- phase 2: apply on THIS thread once the worker has finished ---
+            if refit_job is not None and not refit_job["thread"].is_alive():
+                job, refit_job = refit_job, None
+                failure = None
+
+                if job["error"] is not None:
+                    log_exception("refit_prepare", job["error"])
+                    failure = "preparation"
+                elif job["result"] is None:
+                    # ControlNet is fused into the engine; nothing to refit, but
+                    # the name still advances so we don't retry every frame.
+                    current_lora = job["lora"]
+                else:
+                    try:
+                        refit_apply(stream, *job["result"])
+                    except Exception as e:
+                        log_exception("refit_apply", e)
+                        failure = "the refit step"
+                    else:
+                        current_lora = job["lora"]
+                        state_dict["prompt_dirty"] = True
+                        log("[Engine] Re-preparing TensorRT embeddings after hot-swap...")
+                        stream.prepare(
+                            prompt=state_dict["base_prompt"] + (", closed mouth" if args.audio_sync else ""),
+                            negative_prompt=state_dict["negative_prompt"],
+                            num_inference_steps=50,
+                            guidance_scale=args.guidance_scale,
+                            delta=args.delta,
+                            seed=args.seed,
+                        )
+
+                if failure:
                     # A failed refit must not kill a working stream — the old
-                    # weights are still resident, so carry on with them.
-                    log_exception("refit_lora_to_trt", e)
-                    log(f"[Engine] Hot-swap to '{new_lora}' FAILED; continuing with "
-                        f"the previously loaded weights.")
-                    continue
-                state_dict["prompt_dirty"] = True
-                
-                # Re-warmup
-                log("[Engine] Re-preparing TensorRT embeddings after hot-swap...")
-                stream.prepare(
-                    prompt=state_dict["base_prompt"] + (", closed mouth" if args.audio_sync else ""),
-                    negative_prompt=state_dict["negative_prompt"],
-                    num_inference_steps=50,
-                    guidance_scale=args.guidance_scale,
-                    delta=args.delta,
-                    seed=args.seed,
-                )
+                    # weights are still resident, so carry on with them, and
+                    # leave current_lora naming what is actually loaded.
+                    log(f"[Engine] Hot-swap to '{job['lora']}' FAILED during {failure}; "
+                        f"continuing with the previously loaded weights "
+                        f"('{current_lora}').")
                 # The launcher greys out the LoRA dropdown on send and watches
-                # for this line to re-enable it.
+                # for this line to re-enable it, so EVERY path above has to
+                # reach it — including the failures. Bailing out early here is
+                # what used to leave the dropdown greyed out for good.
                 log(f"[Engine] LoRA hot-swap complete: now using '{current_lora}'.")
 
             if time.time() > warmup_until:
@@ -1562,6 +1849,16 @@ def main():
             if t.is_alive():
                 log(f"[Engine] Worker '{t.name}' did not stop; leaving its "
                     f"resources open rather than freeing them underneath it.")
+        # A refit prep thread has no cancel point — it is inside a torch ONNX
+        # export — so give it a short grace period and then let it go. It owns
+        # no camera, socket or log handle we are about to close; the only cost
+        # of abandoning it is a half-written unet_refit.onnx, which the next
+        # export overwrites before anything reads it.
+        if refit_job is not None and refit_job["thread"].is_alive():
+            log("[Engine] Waiting up to 2s for the background LoRA prep...")
+            refit_job["thread"].join(timeout=2.0)
+            if refit_job["thread"].is_alive():
+                log("[Engine] LoRA prep still running at shutdown; abandoning it.")
         cap.release()
         if audio_tracker is not None:
             audio_tracker.close()
@@ -1578,6 +1875,8 @@ def main():
             zmq_socket.close(linger=0)
         log("[Engine] Shut down cleanly.")
 
+
+def _exit_code_check():
     if FAILED.is_set():
         log("[Engine] Exiting non-zero: a worker thread failed.")
         sys.exit(1)
@@ -1586,6 +1885,13 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+        # Checked HERE rather than at the end of main(), because main() has
+        # early returns. The "Stop received during startup" return in
+        # particular fired when a worker died during the model load (a
+        # cmd_port collision sets FAILED and STOP from the excepthook), and
+        # the process then exited 0 — reporting a hard startup failure to the
+        # GUI as a clean shutdown.
+        _exit_code_check()
     except SystemExit:
         raise
     except BaseException as e:

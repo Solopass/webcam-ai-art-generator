@@ -21,7 +21,10 @@ def process_video():
         except Exception:
             pass
             
-    video_path = settings.get("camera", "")
+    # argv[1] wins: the launcher's Export button validates a path and now
+    # passes it. Before this the button read a path, checked it, threw it away
+    # and rendered whatever "camera" happened to be in the settings file.
+    video_path = sys.argv[1] if len(sys.argv) > 1 else settings.get("camera", "")
     if not os.path.isfile(video_path):
         print(f"[Error] The camera setting '{video_path}' is not a valid video file.")
         return

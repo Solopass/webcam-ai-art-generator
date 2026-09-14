@@ -123,9 +123,9 @@ DEFAULTS = {
     "freeze": 1.0,
     # Image controls. These defaults reproduce values that used to be
     # hardcoded in the engine, so the picture is unchanged out of the box.
-    "sharpness": 1.0,
-    "saturation": 20.0,
-    "brightness": 10.0,
+    "sharpness": 0.0,
+    "saturation": 0.0,
+    "brightness": 0.0,
     "mask_feather": 7.0,
     "temporal_denoise": 0.4,
     "stillness_blend": 0.3,
@@ -236,7 +236,7 @@ class VTuberStudioApp(ctk.CTk):
             # save_settings() deleted them from disk on every START.
             "vfx_opacity": self.vfx_op_var.get(),
             "vfx_blend_mode": self.vfx_blend_var.get(),
-            "seed": self.seed_var.get(),
+            "seed": self._seed(),
             "lora_strength": self.lora_strength_var.get(),
             "audio_sync": self.audio_var.get(),
             "keep_background": self.bg_keep_var.get(),
@@ -260,8 +260,17 @@ class VTuberStudioApp(ctk.CTk):
             settings[f"sens_{k}"] = v.get()
         return settings
 
+    # Keys with a UI but no widget holding their value. _collect_settings is
+    # rebuilt from widgets, so anything here was erased by the very save that
+    # added it — the 💾 button appended a prompt and then deleted the list.
+    # Added HERE and not in _collect_settings on purpose: that feeds presets
+    # and history too, and a preset must never overwrite your saved prompts.
+    WIDGETLESS_KEYS = ("saved_main_prompts", "saved_neg_prompts")
+
     def save_settings(self):
         settings = self._collect_settings()
+        for k in self.WIDGETLESS_KEYS:
+            settings[k] = self._saved_list(k)
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=4)
@@ -277,8 +286,19 @@ class VTuberStudioApp(ctk.CTk):
                     data = json.load(f)
                 if isinstance(data, type(fallback)):
                     return data
-        except Exception:
-            pass
+        except Exception as e:
+            # Silently degrading to the fallback meant a damaged presets.json
+            # showed an empty list, and the next "Save As..." wrote one preset
+            # over the top of it, destroying everything still recoverable.
+            # Keep a copy and say so.
+            try:
+                bak = path + ".corrupt"
+                if not os.path.exists(bak):
+                    os.replace(path, bak)
+                print(f"[Settings] {os.path.basename(path)} is unreadable ({e}); "
+                      f"kept a copy as {os.path.basename(bak)} and started fresh.")
+            except Exception:
+                pass
         return fallback
 
     def _write_json(self, path, data, what):
@@ -344,9 +364,28 @@ class VTuberStudioApp(ctk.CTk):
             # engine kept rendering the old one.
             if "lora" in values:
                 lora = self.lora_var.get()
-                self.send_command({"lora": "None" if lora.startswith("None") else lora})
+                sent = "None" if lora.startswith("None") else lora
+                self.send_command({"lora": sent})
+                # Without this the dropdown's no-op guard still held the
+                # PREVIOUS name, so picking the LoRA the preset had already
+                # loaded looked like a change, greyed the dropdown, and waited
+                # out the full 120s fallback for a swap the engine never ran.
+                self._last_sent_lora = sent
 
         return changed_restart_only
+
+    def _seed(self):
+        """The Seed box as an int, tolerating whatever the user typed in it."""
+        try:
+            return int(str(self.seed_var.get()).strip())
+        except Exception:
+            return 2
+
+    def _saved_list(self, key):
+        """A saved-prompt list from settings, defensively. The file is
+        user-editable JSON, so the value can be anything at all."""
+        v = self.settings.get(key, [])
+        return [str(x) for x in v] if isinstance(v, list) else []
 
     def _settings_var(self, key):
         """Map a settings key onto its Tk variable, or None if it has no widget."""
@@ -710,12 +749,16 @@ class VTuberStudioApp(ctk.CTk):
         seed_box = ctk.CTkFrame(self.right_col, fg_color="transparent")
         seed_box.pack(fill=ctk.X, padx=10, pady=(0, 4))
         ctk.CTkLabel(seed_box, text="Seed:", anchor="w", width=44).pack(side=ctk.LEFT)
-        self.seed_var = ctk.IntVar(value=int(self.settings.get("seed", 2)))
+        # A StringVar, not an IntVar: this is a free-text entry, and IntVar.get()
+        # raises TclError the moment the box is empty or holds a non-integer.
+        # That exception escaped the Tk callback from save_settings() inside
+        # start_script(), so clearing the Seed box silently prevented START.
+        self.seed_var = ctk.StringVar(value=str(int(self.settings.get("seed", 2))))
         self.seed_entry = ctk.CTkEntry(seed_box, textvariable=self.seed_var, width=80)
         self.seed_entry.pack(side=ctk.LEFT, padx=(0, 6))
         def _roll_seed():
             import random
-            self.seed_var.set(random.randint(0, 2 ** 31 - 1))
+            self.seed_var.set(str(random.randint(0, 2 ** 31 - 1)))
         ctk.CTkButton(seed_box, text="🎲", width=34, command=_roll_seed).pack(side=ctk.LEFT)
         ctk.CTkLabel(seed_box, text="(applies on next START)",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(side=ctk.LEFT, padx=6)
@@ -777,21 +820,31 @@ class VTuberStudioApp(ctk.CTk):
             if val == getattr(self, "_last_sent_lora", None):
                 return
             self._last_sent_lora = val
-            # The refit re-fuses the UNet, re-exports ONNX and reloads TRT
-            # weights on the inference thread — 30-60s with the output frozen.
-            # Grey the dropdown so that reads as "busy", not "broken".
+            # The re-fuse and ONNX export run on a worker thread now, so the
+            # picture keeps moving through the slow 30-60s; only the TRT refit
+            # itself stops it, for about a second. Grey the dropdown anyway so
+            # the wait reads as "busy", not "broken", and so a second pick
+            # can't queue up behind the first.
             if not self.send_command({"lora": val}):
                 self.log("[LoRA] Could not reach the engine — is it still starting?")
                 return
-            self.log(f"[LoRA] Swapping to '{val}'. Output freezes for 30-60s "
-                     f"while the engine refits — this is normal.")
+            self.log(f"[LoRA] Swapping to '{val}'. This takes 30-60s; the stream "
+                     f"keeps running (a bit slower) and pauses ~1s at the end.")
             try:
                 self.lora_dropdown.configure(state="disabled")
             except Exception:
                 pass
             self._lora_swap_pending = True
+            # Never cancelled, these stacked up: swap A's 120s timer would fire
+            # ten seconds into swap B and re-enable the dropdown while the
+            # engine was still exporting.
+            if getattr(self, "_lora_timer", None):
+                try:
+                    self.after_cancel(self._lora_timer)
+                except Exception:
+                    pass
             # Fallback in case the engine dies mid-swap and never reports back.
-            self.after(120000, self._end_lora_swap)
+            self._lora_timer = self.after(120000, self._end_lora_swap)
 
         saved_lora = self.settings.get("lora", "None (Original Default)")
         if saved_lora == "None":
@@ -993,9 +1046,43 @@ class VTuberStudioApp(ctk.CTk):
         self._slider_row(12, "LoRA Strength", self.lora_strength_var, 0.0, 1.5, 15,
                          fmt=lambda v: f"{v:.2f}",
                          on_change=lambda v: self.send_command({"lora_strength": float(v)}),
-                         desc="How hard the character LoRA is applied. Takes effect on "
-                              "the next LoRA swap or START — it is baked in when the "
-                              "weights are fused, not applied per frame.")
+                         desc="How hard the character LoRA is applied. Baked in when the "
+                              "weights are fused, not applied per frame — so move the "
+                              "slider, then press Apply to re-fuse at the new value.")
+
+        def _apply_lora_strength():
+            if self.process is None:
+                self.log("[LoRA] Strength applies at START while the engine is stopped.")
+                return
+            if getattr(self, "_lora_swap_pending", False):
+                self.log("[LoRA] A swap is already in progress; try again when it lands.")
+                return
+            self.send_command({"lora_strength": float(self.lora_strength_var.get())})
+            # Re-fuses the CURRENT LoRA at the new strength. Same cost as a
+            # swap, which is only reasonable now that the slow half runs off
+            # the inference thread — before this the picture would have frozen.
+            if not self.send_command({"lora_refresh": True}):
+                self.log("[LoRA] Could not reach the engine.")
+                return
+            self.log(f"[LoRA] Re-fusing at strength "
+                     f"{self.lora_strength_var.get():.2f}. Takes 30-60s; the stream "
+                     f"keeps running and pauses ~1s at the end.")
+            try:
+                self.lora_dropdown.configure(state="disabled")
+            except Exception:
+                pass
+            self._lora_swap_pending = True
+            if getattr(self, "_lora_timer", None):
+                try:
+                    self.after_cancel(self._lora_timer)
+                except Exception:
+                    pass
+            self._lora_timer = self.after(120000, self._end_lora_swap)
+
+        self.lora_apply_btn = ctk.CTkButton(
+            self.settings_frame, text="↻ Apply Strength", width=120,
+            command=_apply_lora_strength)
+        self.lora_apply_btn.grid(row=13, column=1, padx=5, pady=(0, 6), sticky="e")
 
         self.clahe_var = ctk.BooleanVar(value=self.settings.get("normalize_lighting", False))
         self.clahe_cb = ctk.CTkSwitch(self.right_col, text="Normalize Lighting (CLAHE)",
@@ -1196,7 +1283,11 @@ class VTuberStudioApp(ctk.CTk):
             self.save_settings()
             self.log(f"[Export] Starting Offline VFX Render for {video_path}...")
             try:
-                subprocess.Popen([self.python_executable(), "process_video.py"])
+                # The path was read, validated, and then never passed — the
+                # render used whatever "camera" happened to be in the settings
+                # file. process_video.py now takes it as argv[1].
+                subprocess.Popen([self.python_executable(), "process_video.py",
+                                  video_path])
                 self.log("[Export] process_video.py launched in the background. Check console for progress.")
             except Exception as e:
                 self.log(f"[Export] Error launching: {e}")
@@ -1408,8 +1499,14 @@ class VTuberStudioApp(ctk.CTk):
         self.apply_prompt(quiet=True)
             
     def toggle_freeze(self):
+        # The flip used to happen before this check, so a press while stopped
+        # left manual_freeze True with nothing frozen: the button came up green
+        # on the next START and the first real F8 press turned freeze OFF.
+        if not getattr(self, "cmd_socket", None):
+            self.log("[Engine] Cannot freeze: Engine is not running.")
+            return
         self.manual_freeze = not getattr(self, "manual_freeze", False)
-        if getattr(self, "cmd_socket", None):
+        if True:
             import json
             self.cmd_socket.send_string(json.dumps({"manual_freeze": self.manual_freeze}))
             if self.manual_freeze:
@@ -1418,9 +1515,7 @@ class VTuberStudioApp(ctk.CTk):
             else:
                 self.log("[Engine] Manual Freeze OFF: Resumed webcam.")
                 self.freeze_btn.configure(text="❄️ Manual Freeze (F8)", fg_color=["#3a7ebf", "#1f538d"], hover_color=["#325882", "#14375e"])
-        else:
-            self.log("[Engine] Cannot freeze: Engine is not running.")
-            
+
     def take_snapshot(self):
         # We now send a command to the engine to save the high-res uncompressed frames!
         if getattr(self, "cmd_socket", None):
@@ -1436,6 +1531,12 @@ class VTuberStudioApp(ctk.CTk):
         from datetime import datetime
         
         if not self.is_recording:
+            # Frames only reach the writer while a process is running, so
+            # recording without one produced a valid-looking MP4 with zero
+            # frames and logged "Recording saved successfully!".
+            if self.process is None:
+                self.log("[Engine] Cannot record: the engine is not running.")
+                return
             # Start Recording
             out_dir = os.path.join(SCRIPT_DIR, "snapshots")
             os.makedirs(out_dir, exist_ok=True)
@@ -1453,13 +1554,26 @@ class VTuberStudioApp(ctk.CTk):
             self.record_btn.configure(text="⏹️ Stop Recording", fg_color="#5bc0de", hover_color="#31b0d5")
             self.log(f"[Engine] Started recording to {filename}...")
         else:
-            # Stop Recording
-            self.is_recording = False
-            if self.video_writer is not None:
+            self._finish_recording("Recording saved successfully!")
+
+    def _finish_recording(self, why):
+        """Close the writer and reset the button. Safe to call when idle."""
+        self.is_recording = False
+        if self.video_writer is not None:
+            try:
                 self.video_writer.close()
-                self.video_writer = None
-            self.record_btn.configure(text="🔴 Start Recording", fg_color="#d9534f", hover_color="#c9302c")
-            self.log("[Engine] Recording saved successfully!")
+            except Exception as e:
+                # The one writer-close in this file that used to be unguarded.
+                # An exception here escaped the Tk callback and left the button
+                # stuck on "Stop Recording" with an orphaned writer.
+                self.log(f"[Engine] Recording close failed: {e}")
+            self.video_writer = None
+        try:
+            self.record_btn.configure(text="🔴 Start Recording",
+                                      fg_color="#d9534f", hover_color="#c9302c")
+        except Exception:
+            pass
+        self.log(f"[Engine] {why}")
 
     def save_replay(self):
         if self.saving or len(self.frame_buffer) == 0:
@@ -1549,6 +1663,17 @@ class VTuberStudioApp(ctk.CTk):
         missing = getattr(self, "_selftest_waiting", {})
         total = getattr(self, "_selftest_total", 0)
         passed = total - len(missing)
+        # on_process_exit clears _selftest_waiting, so an engine that died
+        # mid-test left missing == {} and this reported an unconditional PASS
+        # for a run in which nothing answered at all.
+        if getattr(self, "_selftest_aborted", False) or not total:
+            self._selftest_aborted = False
+            self._selftest_total = 0
+            self._selftest_waiting = {}
+            self.log("[Self-test] ABORTED — the engine stopped before the "
+                     "results came back. Nothing was verified.")
+            return
+        self._selftest_total = 0
         if not missing:
             self.log(f"[Self-test] PASS — all {total} live controls answered.")
         else:
@@ -1569,7 +1694,21 @@ class VTuberStudioApp(ctk.CTk):
         self.preset_var.set(names[(i + step) % len(names)])
         self.on_preset_load()
 
+    def _typing(self, event=None):
+        """True when focus is in a text widget, so a shortcut must stand down.
+
+        Every binding here is on the toplevel, which in Tk's bindtag order
+        (widget, class, toplevel, all) fires no matter which widget has focus —
+        and returning "break" from it also aborts the `all` tag, where Tab's
+        focus traversal lives. So Tab stopped moving between the prompt boxes
+        anywhere in the app, and pressed A/B instead.
+        """
+        w = getattr(event, "widget", None) or self.focus_get()
+        return w.__class__.__name__ in ("Entry", "Text", "CTkEntry", "CTkTextbox")
+
     def _ab_press(self, _event=None):
+        if self._typing(_event):
+            return None          # let Tk move focus as usual
         # Tab normally moves focus; "break" keeps it as our shortcut.
         if not getattr(self, "_ab_active", False):
             self._ab_active = True
@@ -1723,7 +1862,7 @@ class VTuberStudioApp(ctk.CTk):
             "--stillness_blend", f"{self.stillness_var.get():.3f}",
             "--vfx_opacity", f"{self.vfx_op_var.get():.3f}",
             "--vfx_blend_mode", self.vfx_blend_var.get(),
-            "--seed", str(int(self.seed_var.get())),
+            "--seed", str(self._seed()),
             "--lora_strength", f"{self.lora_strength_var.get():.3f}",
         ]
         if self.no_segment_var.get():
@@ -1852,7 +1991,17 @@ class VTuberStudioApp(ctk.CTk):
         self.after(0, self.on_process_exit, code)
 
     def on_process_exit(self, code):
-        if code:
+        forced = getattr(self, "_force_killed", False)
+        self._force_killed = False
+        if code and forced:
+            # We killed it, so there is no error above to look at. Saying there
+            # is sends people hunting through the log for a crash that never
+            # happened — which is exactly what a STOP during a 5-15 minute
+            # TensorRT build produced, every single time.
+            self.log(f"=== Engine force-stopped (code {code}). It was inside a "
+                     f"step that cannot be interrupted — most likely a TensorRT "
+                     f"build. Nothing crashed. ===")
+        elif code:
             self.log(f"=== Engine exited with code {code} (see the error above) ===")
         else:
             self.log("=== Engine Shut Down ===")
@@ -1869,7 +2018,17 @@ class VTuberStudioApp(ctk.CTk):
         self._end_lora_swap()
         self.manual_freeze = False
         self._ab_active = False
+        # Otherwise a Ctrl+S right after a restart writes a clip that splices
+        # the end of the previous session onto the start of the new one.
+        self.frame_buffer.clear()
+        # A recording is fed only while a process exists, so leaving it open
+        # meant the next START appended its frames to the same file and the
+        # two sessions were butt-joined with the gap silently removed.
+        if self.is_recording:
+            self._finish_recording("Recording stopped: the engine exited.")
         self._selftest_waiting = {}
+        if getattr(self, "_selftest_total", 0):
+            self._selftest_aborted = True
         if getattr(self, "closing", False):
             return
         self.start_btn.configure(state="normal")
@@ -1921,6 +2080,20 @@ class VTuberStudioApp(ctk.CTk):
             return
         except subprocess.TimeoutExpired:
             pass
+        # Six seconds is not enough for a stop that lands inside the TensorRT
+        # build, which is a single uninterruptible call. Say what is happening
+        # and give it a real chance before forcing, so the common case stops
+        # cleanly instead of being killed mid-write.
+        self.after(0, self.log, "[Engine] Still shutting down — it is inside a "
+                                "step that cannot be interrupted (most likely a "
+                                "TensorRT build). Waiting up to 60s.")
+        try:
+            proc.wait(timeout=60)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self._force_killed = True
+        self.after(0, self.log, "[Engine] Forcing it down now.")
         try:
             proc.terminate()
             proc.wait(timeout=5)

@@ -303,14 +303,26 @@ for payload, marker in probes:
     assert marker.rstrip(":") in eng, f"self-test waits for {marker!r} which the engine never logs"
 print("PASS  every self-test marker appears in the engine's log strings")
 
-# --- 19. new image sliders default to the old hardcoded values -------------
-for key, want in (("sharpness", 1.0), ("saturation", 20.0), ("brightness", 10.0),
+# --- 19. image-slider defaults must match the engine's, and be neutral -----
+# These three used to default to the values the engine once hardcoded (1.0 /
+# +20 / +10). That was correct while the stage they feed was gated off and
+# dead. Now that the stage actually runs, the same defaults would sharpen and
+# saturate every existing user's picture on upgrade, so they are neutral and
+# an untouched slider changes nothing.
+for key, want in (("sharpness", 0.0), ("saturation", 0.0), ("brightness", 0.0),
                   ("mask_feather", 7.0), ("temporal_denoise", 0.4),
                   ("stillness_blend", 0.3)):
     assert launcher.DEFAULTS[key] == want, (key, launcher.DEFAULTS[key])
-assert "--sharpness\", type=float, default=1.0" in eng.replace("'", '"') or \
-       'default=1.0)' in eng
-print("PASS  image sliders default to the previously hardcoded values")
+# GUI and engine defaults must agree, or a run started from the CLI looks
+# different from the same settings started from the GUI.
+import re as _re
+for key in ("sharpness", "saturation", "brightness"):
+    m = _re.search(rf'"--{key}", type=(\w+), default=([\d.]+)\)', eng)
+    assert m, f"--{key} argument not found in the engine"
+    assert float(m.group(2)) == launcher.DEFAULTS[key], (
+        f"--{key} defaults to {m.group(2)} in the engine but "
+        f"{launcher.DEFAULTS[key]} in the GUI")
+print("PASS  image sliders default to a true no-op, and GUI matches engine")
 
 # --- 20. the randomizer's positive must not fight the preset's negative ---
 neg = "3d, render, realistic, photo, blurry, deformed"
@@ -335,5 +347,130 @@ assert '"ab_raw" in cmd' in eng21 and 'state_dict.get("ab_raw", False)' in eng21
 gui22 = open(os.path.join(HERE, "launcher.py"), encoding="utf-8").read()
 assert '{"ab_raw": True}' in gui22 and '{"ab_raw": False}' in gui22
 print("PASS  A/B raw-camera toggle wired in both directions")
+
+# --- 23. the Seed box must survive whatever the user types in it ----------
+# It was an IntVar behind a free-text CTkEntry, so IntVar.get() raised TclError
+# the moment the box was empty. save_settings() is called from start_script()
+# outside any try/except, so clearing Seed silently prevented START with
+# nothing in the GUI log.
+import inspect
+src_l = inspect.getsource(launcher)
+assert "ctk.IntVar(value=int(self.settings.get(\"seed\"" not in src_l, \
+    "the Seed box is an IntVar again; clearing it raises TclError and blocks START"
+assert "def _seed(self)" in src_l, "no tolerant reader for the Seed box"
+for bad in ("", "   ", "abc", "12.5", None):
+    app.seed_var = type("V", (), {"get": staticmethod(lambda b=bad: b)})()
+    got = App._seed(app)
+    assert isinstance(got, int), f"_seed({bad!r}) returned {got!r}, not an int"
+app.seed_var = type("V", (), {"get": staticmethod(lambda: " 4242 ")})()
+assert App._seed(app) == 4242, "the Seed box no longer reads a normal value"
+print("PASS  the Seed box tolerates empty/garbage input and still starts")
+
+# --- 24. a preset that carries a LoRA must update the dropdown's guard ----
+# on_lora_changed skips sending when the value equals _last_sent_lora. A preset
+# load sent the LoRA directly without updating it, so picking that same LoRA
+# afterwards looked like a change: the dropdown greyed, the engine correctly
+# did nothing, and no completion line ever came back -> greyed out for the
+# full 120s fallback.
+blk = src_l[src_l.index('if "lora" in values:'):]
+blk = blk[:blk.index("return changed_restart_only")]
+assert "_last_sent_lora" in blk, (
+    "the preset/history load sends a LoRA without updating _last_sent_lora, so "
+    "the dropdown's no-op guard goes stale and re-arms the 120s grey-out")
+print("PASS  a preset load keeps the LoRA dropdown's no-op guard in step")
+
+# --- 25. per-run state must not leak across a stop -------------------------
+import inspect as _i
+_src = _i.getsource(launcher)
+_exit = _src[_src.index("def on_process_exit"):]
+_exit = _exit[:_exit.index("\n    def ", 10)]
+for needle, why in (
+        ("_finish_recording", "a recording left open after the engine exits "
+                              "splices the next session onto the same file"),
+        ("frame_buffer.clear()", "the replay deque splices two sessions"),
+        ("_selftest_aborted", "a self-test running when the engine dies reports "
+                              "an unconditional PASS, because on_process_exit "
+                              "clears the waiting set it checks"),
+        ("manual_freeze = False", "a stale freeze flag inverts the button"),
+        ("_end_lora_swap", "the LoRA dropdown stays greyed after a crash")):
+    assert needle in _exit, f"on_process_exit no longer resets: {why}"
+print("PASS  on_process_exit resets recording, replay, self-test, freeze and LoRA state")
+
+# a self-test cut short must say so rather than claiming everything answered
+_rep = _src[_src.index("def _selftest_report"):]
+_rep = _rep[:_rep.index("\n    def ", 10)]
+assert "_selftest_aborted" in _rep and "ABORTED" in _rep, \
+    "the self-test still reports PASS when the engine died mid-test"
+assert _rep.index("_selftest_aborted") < _rep.index("if not missing:"), \
+    "the abort check must come before the pass/fail branch"
+print("PASS  a self-test interrupted by an engine exit reports ABORTED, not PASS")
+
+# --- 26. controls that need a running engine must check for one -----------
+_fr = _src[_src.index("def toggle_freeze"):]
+_fr = _fr[:_fr.index("\n    def ", 10)]
+assert _fr.index("cmd_socket") < _fr.index("self.manual_freeze ="), \
+    "toggle_freeze still flips manual_freeze before checking the engine is up, " \
+    "so a press while stopped inverts the button for the next run"
+_rec = _src[_src.index("def toggle_recording"):]
+_rec = _rec[:_rec.index("def _finish_recording")]
+assert "self.process is None" in _rec and "if False" not in _rec, \
+    "recording can still be started with no engine, producing an empty MP4 " \
+    "that reports 'saved successfully'"
+print("PASS  freeze and record both require a running engine")
+
+# --- 27. Tab must still traverse focus while typing -----------------------
+# Every shortcut is bound on the toplevel, which fires regardless of focus, and
+# returning "break" there also aborts Tk's `all` bindtag where Tab traversal
+# lives — so Tab stopped moving between the prompt boxes anywhere in the app.
+_ab = _src[_src.index("def _ab_press"):]
+_ab = _ab[:_ab.index("\n    def ", 10)]
+assert "_typing" in _ab and _ab.index("_typing") < _ab.index('return "break"'), \
+    "the A/B Tab shortcut still swallows Tab while the user is typing"
+assert "def _typing" in _src
+for cls in ("Entry", "CTkEntry", "CTkTextbox"):
+    assert cls in _src[_src.index("def _typing"):_src.index("def _ab_press")], cls
+print("PASS  Tab traverses focus in text fields and only triggers A/B elsewhere")
+
+# --- 28. the LoRA fallback timer must be cancelled, not stacked -----------
+assert "after_cancel(self._lora_timer)" in _src, \
+    "each swap schedules another 120s timer without cancelling the last, so an " \
+    "old timer re-enables the dropdown in the middle of a newer swap"
+assert "self._lora_timer = self.after(120000" in _src
+print("PASS  the LoRA fallback timer is cancelled before a new one is scheduled")
+
+# --- 29. a killed engine must not be reported as a crash ------------------
+assert _src.count("_force_killed") >= 3, \
+    "a STOP we forced still logs 'see the error above' with no error above; " \
+    "the flag must be SET in the kill path, and read+cleared in on_process_exit"
+_gs = _src[_src.index("proc.terminate()") - 1500:_src.index("proc.terminate()")]
+assert "self._force_killed = True" in _gs, \
+    "nothing sets _force_killed on the path that actually kills the process"
+assert "proc.wait(timeout=60)" in _src, \
+    "a stop landing inside the uninterruptible TensorRT build still gets only " \
+    "6 seconds before being killed mid-write"
+print("PASS  a forced stop is reported honestly, and gets time to finish first")
+
+# --- 30. a corrupt settings file must be preserved, not overwritten -------
+_rj = _src[_src.index("def _read_json"):_src.index("def _write_json")]
+assert ".corrupt" in _rj, \
+    "an unreadable presets.json still degrades silently to empty, and the next " \
+    "Save As overwrites every preset that was still recoverable"
+print("PASS  an unreadable settings file is kept aside instead of overwritten")
+
+# --- 31. STOP must be honoured around the uninterruptible build ----------
+# main() only checked STOP *after* the whole model load returned, so a stop
+# during a 5-15 minute TensorRT build was ignored entirely: the launcher's
+# grace period expired and it fell through to TerminateProcess, with a phantom
+# "see the error above" and a risk of a truncated unet.engine.
+eng_src = open(os.path.join(HERE, "realtime_video.py"), encoding="utf-8").read()
+assert "def _abort_if_stopped" in eng_src and "class EngineStopped" in eng_src
+_load = eng_src[eng_src.index("def load_model_and_engine"):eng_src.index("def refit_prepare")]
+assert _load.count("_abort_if_stopped") >= 2, (
+    "load_model_and_engine has no STOP checkpoints, so a stop during startup "
+    "is ignored until the whole build finishes")
+assert "_abort_if_stopped(\"before the TensorRT build\")" in _load
+assert "except EngineStopped:" in eng_src, \
+    "EngineStopped escapes main() and is reported as a crash"
+print("PASS  STOP is honoured at each startup checkpoint around the build")
 
 print("\nALL PASS")
